@@ -96,6 +96,7 @@ def cmd_serve(args):
         "max_model_len": args.max_model_len,
         "max_num_seqs": args.max_num_seqs,
         "mtp_tokens": args.mtp,
+        "dflash2": args.dflash2,
         "reasoning_effort_default": args.reasoning_effort,
         "keepalive_min": args.keepalive_min,
         "weights_dataset": args.weights_dataset,
@@ -335,6 +336,9 @@ def main():
                    help="MTP speculative tokens (0 disables). +34%% decode in our A/B test; made "
                         "lossless by the bundled GDN state-rollback patch "
                         "(verified 12/12 greedy exact-match)")
+    s.add_argument("--dflash2", action="store_true",
+                   help="Use DFlash2 block-diffusion drafter instead of MTP "
+                        "(~3.4x vs autoregressive; uses incoai/Qwen3.8-27B-DFlash2 draft model)")
     s.add_argument("--reasoning-effort", default="xhigh",
                    choices=["xhigh", "medium", "low"],
                    help="server-side default; clients can still override per request")

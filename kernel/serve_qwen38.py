@@ -52,6 +52,9 @@ DEFAULTS = {
                                    # rollback); we apply patches/mtp-rollback-v0280.diff
                                    # (a port of upstream PR #3178) before serving —
                                    # verified lossless, 12/12 greedy exact-match.
+    "dflash2": False,               # DFlash2 block-diffusion drafter (3.4x vs autoregressive).
+                                   # Uses incoai/Qwen3.8-27B-DFlash2 draft model.
+                                   # When True, MTP is disabled (mutually exclusive).
     "reasoning_effort_default": "xhigh",   # server-side default: xhigh | medium | low
     "tool_call_parser": "qwen3_coder",  # matches Qwen3.8's XML tool format; "" disables
     "text_only": False,            # True: skip the vision tower + its TPU graphs (saves ~8 min,
@@ -268,7 +271,9 @@ if runtime is None or not runtime_ok():
     publish("failed", step="install")
     sys.exit(1)
 publish("installed", secs=int(time.time() - t), via=runtime)
-if apply_mtp_patch():
+if CFG.get("dflash2"):
+    log("   DFlash2 mode: skipping MTP patch")
+elif apply_mtp_patch():
     publish("mtp-patch-applied")
 elif CFG["mtp_tokens"] > 0:
     publish("mtp-patch-failed", note="disabling MTP: unsafe without the rollback patch")
@@ -340,7 +345,13 @@ def server_args(cfg):
         # Qwen3.8 is a vision-language checkpoint; we only serve text. This skips
         # the vision tower and roughly halves the number of TPU graphs to compile.
         args += ["--limit-mm-per-prompt", json.dumps({"image": 0, "video": 0})]
-    if cfg["mtp_tokens"] > 0:
+    if cfg.get("dflash2"):
+        # DFlash2 block-diffusion drafter
+        draft_model = "incoai/Qwen3.8-27B-DFlash2"
+        args += ["--speculative-config",
+                 json.dumps({"method": "dflash", "model": draft_model,
+                             "num_speculative_tokens": 7})]
+    elif cfg["mtp_tokens"] > 0:
         args += ["--speculative-config",
                  json.dumps({"method": "mtp", "num_speculative_tokens": cfg["mtp_tokens"]})]
     if cfg["tool_call_parser"]:
