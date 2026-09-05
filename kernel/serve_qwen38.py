@@ -38,6 +38,26 @@ import time
 import urllib.request
 from pathlib import Path
 
+# --- DFlash2 architecture alias for vLLM 0.28.0 ---
+# vLLM 0.28.0 registers DFlashDraftModel but not DFlash2DraftModel in its
+# model registry. Patch at import time so SpeculativeConfig validation passes.
+def _patch_dflash2_registry():
+    try:
+        import vllm.model_executor.models as _mm
+        # Add the class alias
+        if hasattr(_mm, 'DFlashDraftModel') and not hasattr(_mm, 'DFlash2DraftModel'):
+            _mm.DFlash2DraftModel = _mm.DFlashDraftModel
+        # Patch ModelRegistry._MODELS if it exists
+        _reg = getattr(_mm, 'ModelRegistry', None)
+        if _reg and hasattr(_reg, '_MODELS'):
+            _models = _reg._MODELS
+            if 'DFlashDraftModel' in _models and 'DFlash2DraftModel' not in _models:
+                _models['DFlash2DraftModel'] = _models['DFlashDraftModel']
+    except ImportError:
+        pass
+
+_patch_dflash2_registry()
+
 CFG = None  # __LAUNCHER_CONFIG__  (launch.py replaces this line)
 
 DEFAULTS = {
@@ -273,6 +293,15 @@ if runtime is None or not runtime_ok():
 publish("installed", secs=int(time.time() - t), via=runtime)
 if CFG.get("dflash2"):
     log("   DFlash2 mode: skipping MTP patch")
+
+    # Monkey-patch DFlash2 -> DFlashDraftModel for vLLM 0.28.0 compatibility
+    try:
+        import vllm.model_executor.models as _mm
+        if hasattr(_mm, 'DFlashDraftModel') and not hasattr(_mm, 'DFlash2DraftModel'):
+            _mm.DFlash2DraftModel = _mm.DFlashDraftModel
+            log("   DFlash2 alias: DFlash2DraftModel -> DFlashDraftModel (vLLM 0.28.0 compat)")
+    except Exception as _e:
+        log(f"   DFlash2 alias failed: {_e}")
 elif apply_mtp_patch():
     publish("mtp-patch-applied")
 elif CFG["mtp_tokens"] > 0:
