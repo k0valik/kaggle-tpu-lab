@@ -309,10 +309,18 @@ if CFG.get("dflash2"):
                 # Add DFlash2DraftModel as a new entry after DFlashDraftModel
                 _txt = _txt.replace(
                     "'DFlashDraftModel'",
-                    "'DFlashDraftModel', 'DFlash2DraftModel'", 1)
+                    "'DFlashDraftModel', 'DFlash2DraftModel'")
                 Path(_fpath).write_text(_txt)
+                # Remove .pyc cache so Python recompiles from patched source
+                _pyc = Path(_fpath).with_suffix('.pyc')
+                if _pyc.exists():
+                    _pyc.unlink()
+                # Also check __pycache__ directory
+                _cache = Path(_fpath).parent / "__pycache__" / (Path(_fpath).stem + ".cpython-312.pyc")
+                if _cache.exists():
+                    _cache.unlink()
                 _patched += 1
-                log(f"   DFlash2: patched {Path(_fpath).name}")
+                log(f"   DFlash2: patched {Path(_fpath).name} (+ cleared .pyc)")
         if _patched == 0:
             log("   DFlash2: no files to patch (already patched or not found)")
     except Exception as _e:
