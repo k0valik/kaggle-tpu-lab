@@ -306,8 +306,10 @@ if CFG.get("dflash2"):
                 continue
             _txt = Path(_fpath).read_text()
             if "DFlash2DraftModel" not in _txt:
-                _txt = _txt.replace("DFlashDraftModel",
-                                    "DFlashDraftModel', 'DFlash2DraftModel", 1)
+                # Add DFlash2DraftModel as a new entry after DFlashDraftModel
+                _txt = _txt.replace(
+                    "'DFlashDraftModel'",
+                    "'DFlashDraftModel', 'DFlash2DraftModel'", 1)
                 Path(_fpath).write_text(_txt)
                 _patched += 1
                 log(f"   DFlash2: patched {Path(_fpath).name}")
