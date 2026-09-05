@@ -294,29 +294,27 @@ publish("installed", secs=int(time.time() - t), via=runtime)
 if CFG.get("dflash2"):
     log("   DFlash2 mode: skipping MTP patch")
 
-    # Patch vLLM 0.28.0 source to accept DFlash2DraftModel architecture
-    # The monkey-patch approach fails because vLLM runs in a subprocess (venv).
-    # Instead, modify the installed vLLM source directly before server starts.
+    # Patch vLLM 0.28.0 model registry to accept DFlash2DraftModel
     try:
-        import glob as _glob
-        _arg_files = _glob.glob("/tmp/venv/lib/python3.12/site-packages/vllm/engine/arg_utils.py")
-        if _arg_files:
-            _f = Path(_arg_files[0])
-            _txt = _f.read_text()
+        import subprocess as _sp
+        _venv = "/tmp/venv/lib/python3.12/site-packages/vllm"
+        _res = _sp.run(["grep", "-rl", "DFlashDraftModel", _venv],
+                       capture_output=True, text=True, timeout=10)
+        _patched = 0
+        for _fpath in _res.stdout.strip().split("\n"):
+            if not _fpath:
+                continue
+            _txt = Path(_fpath).read_text()
             if "DFlash2DraftModel" not in _txt:
-                _txt = _txt.replace(
-                    "'DFlashDraftModel'",
-                    "'DFlashDraftModel', 'DFlash2DraftModel'",
-                    1  # only first occurrence
-                )
-                _f.write_text(_txt)
-                log("   DFlash2: patched vLLM arg_utils.py to accept DFlash2DraftModel")
-            else:
-                log("   DFlash2: vLLM already patched")
-        else:
-            log("   DFlash2: arg_utils.py not found (runtime not installed yet?)")
+                _txt = _txt.replace("DFlashDraftModel",
+                                    "DFlashDraftModel', 'DFlash2DraftModel", 1)
+                Path(_fpath).write_text(_txt)
+                _patched += 1
+                log(f"   DFlash2: patched {Path(_fpath).name}")
+        if _patched == 0:
+            log("   DFlash2: no files to patch (already patched or not found)")
     except Exception as _e:
-        log(f"   DFlash2: patch failed: {_e}")
+        log(f"   DFlash2: registry patch failed: {_e}")
 elif apply_mtp_patch():
     publish("mtp-patch-applied")
 elif CFG["mtp_tokens"] > 0:
