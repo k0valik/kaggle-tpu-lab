@@ -294,14 +294,29 @@ publish("installed", secs=int(time.time() - t), via=runtime)
 if CFG.get("dflash2"):
     log("   DFlash2 mode: skipping MTP patch")
 
-    # Monkey-patch DFlash2 -> DFlashDraftModel for vLLM 0.28.0 compatibility
+    # Patch vLLM 0.28.0 source to accept DFlash2DraftModel architecture
+    # The monkey-patch approach fails because vLLM runs in a subprocess (venv).
+    # Instead, modify the installed vLLM source directly before server starts.
     try:
-        import vllm.model_executor.models as _mm
-        if hasattr(_mm, 'DFlashDraftModel') and not hasattr(_mm, 'DFlash2DraftModel'):
-            _mm.DFlash2DraftModel = _mm.DFlashDraftModel
-            log("   DFlash2 alias: DFlash2DraftModel -> DFlashDraftModel (vLLM 0.28.0 compat)")
+        import glob as _glob
+        _arg_files = _glob.glob("/tmp/venv/lib/python3.12/site-packages/vllm/engine/arg_utils.py")
+        if _arg_files:
+            _f = Path(_arg_files[0])
+            _txt = _f.read_text()
+            if "DFlash2DraftModel" not in _txt:
+                _txt = _txt.replace(
+                    "'DFlashDraftModel'",
+                    "'DFlashDraftModel', 'DFlash2DraftModel'",
+                    1  # only first occurrence
+                )
+                _f.write_text(_txt)
+                log("   DFlash2: patched vLLM arg_utils.py to accept DFlash2DraftModel")
+            else:
+                log("   DFlash2: vLLM already patched")
+        else:
+            log("   DFlash2: arg_utils.py not found (runtime not installed yet?)")
     except Exception as _e:
-        log(f"   DFlash2 alias failed: {_e}")
+        log(f"   DFlash2: patch failed: {_e}")
 elif apply_mtp_patch():
     publish("mtp-patch-applied")
 elif CFG["mtp_tokens"] > 0:
