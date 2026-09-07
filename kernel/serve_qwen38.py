@@ -211,6 +211,29 @@ def runtime_ok():
     return False
 
 
+def tpu_topology_ok():
+    """Fail early when Kaggle accepted TPU metadata but provisioned a CPU VM."""
+    probe = (
+        "import json, jax\n"
+        "print(json.dumps([{'platform': d.platform, 'kind': d.device_kind, "
+        "'id': d.id} for d in jax.devices()]))"
+    )
+    r = subprocess.run([PY, "-c", probe], capture_output=True, text=True)
+    try:
+        devices = json.loads(r.stdout.strip().splitlines()[-1]) if r.returncode == 0 else []
+    except (IndexError, json.JSONDecodeError):
+        devices = []
+    summary = [f"{d.get('platform')}:{d.get('id')} ({d.get('kind')})" for d in devices]
+    if len(devices) == 8 and all(d.get("platform") == "tpu" for d in devices):
+        log("   TPU topology check OK:", ", ".join(summary))
+        return True
+    detail = (r.stderr or r.stdout)[-800:] if not devices else ", ".join(summary)
+    log("   TPU topology check FAILED:", detail or "no JAX devices reported")
+    log("   Expected 8 TPU devices. In Kaggle, stop this session, open Session options, ")
+    log("   select Accelerator -> TPU VM v5e-8, confirm account verification/quota, then rerun.")
+    return False
+
+
 def install_runtime(built=None):
     """Fresh venv with vllm-tpu pinned. CPU torch (what vllm-tpu's own Docker
     image uses) — the default PyPI torch drags in ~3 GB of CUDA libraries that
@@ -268,6 +291,9 @@ if runtime is None or not runtime_ok():
     publish("failed", step="install")
     sys.exit(1)
 publish("installed", secs=int(time.time() - t), via=runtime)
+if not tpu_topology_ok():
+    publish("failed", step="tpu-topology", expected=8)
+    sys.exit(1)
 if apply_mtp_patch():
     publish("mtp-patch-applied")
 elif CFG["mtp_tokens"] > 0:

@@ -35,6 +35,9 @@ new measurements from this fork. The reviewed source for this version is at
 
 Then run top to bottom. The last cell remains active because it is the server.
 Wait for the `READY` banner before using the displayed endpoint and API key.
+If startup reports `TPU topology check FAILED` or only `cpu:0`, stop the session,
+reselect **TPU VM v5e-8** in Session options, confirm account verification/quota,
+and rerun. The script stops before loading the weights when no TPU was allocated.
 
 > Security: your Kaggle access token never belongs in this notebook. Each run
 > generates a fresh inference API key. Treat the endpoint and key as temporary
@@ -103,6 +106,9 @@ The script builds the pinned TPU runtime, restores the matching XLA cache, finds
 the attached weights, starts vLLM across all eight TPU chips, opens a temporary
 Cloudflare tunnel, and performs a short self-test. The endpoint may return 502
 until the `READY` banner appears.
+
+The launch also verifies that JAX sees exactly eight TPU devices. A CPU-only
+session is a Kaggle provisioning/settings issue, not a model-loading failure.
 
 Use the values printed in that banner:
 

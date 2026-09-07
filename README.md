@@ -48,6 +48,12 @@ Set **Accelerator = TPU VM v5e-8**, **Internet = ON**, attach the two datasets n
 the first cell, and run top to bottom. The last cell *is* the server — the endpoint URL
 and API key appear in its output.
 
+If the run reports `TPU topology check FAILED` or lists only `cpu:0`, Kaggle did not
+allocate the requested accelerator. Stop the session, open **Session options**, select
+**TPU VM v5e-8** explicitly, and rerun. If the option is unavailable, check account
+phone verification, remaining TPU quota, and whether another TPU session is active.
+The kernel now stops before loading 55 GB of weights in this situation.
+
 The original author's notebook remains available at
 [rahim3/qwen3-8-27b-bf16-on-kaggle-tpu-130-tok-s-api](https://www.kaggle.com/code/rahim3/qwen3-8-27b-bf16-on-kaggle-tpu-130-tok-s-api).
 
@@ -191,6 +197,9 @@ folder in the Kaggle UI (Output tab → New Dataset).
 
 ## Good to know / limits
 
+- A successful notebook version upload does not prove that the backing session received
+  a TPU. The startup preflight requires exactly eight JAX TPU devices and gives a focused
+  recovery message instead of failing later inside the vLLM mesh setup.
 - **One TPU session at a time** per Kaggle account, sessions cap at 9 h, free quota is
   ~20 TPU-hours/week. The server auto-stops after `--keepalive-min` so a forgotten
   session doesn't eat your quota.
