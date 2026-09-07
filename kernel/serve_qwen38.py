@@ -5,19 +5,11 @@ This script is pushed to Kaggle as a script kernel by ../launch.py, which fills
 in the CFG line below. It also runs standalone with defaults (e.g. pasted into
 a Kaggle notebook/script in the UI) — then it just prints instead of using ntfy.
 
-Steps (each one is announced in the log):
-  1/6  runtime  — venv with vllm-tpu (pinned, CPU torch) built by uv in ~30 s,
-                  resolution pinned to the env dataset's build date; + the MTP fix
-  2/6  cache    — restore the pre-built XLA compile cache from the env dataset
-  3/6  weights  — find the mounted weights dataset (or download from HF to /tmp)
-  4/6  server   — start vLLM (TP=8, text-only, MTP speculative decoding)
-  5/6  tunnel   — open a public cloudflared URL (printed before the server is
-                  live so you can prepare your client)
-  6/6  ready    — READY banner + self-test, then keep serving until
-                  keepalive_min elapses
-
-With both datasets attached the endpoint is live in ~22 minutes (~12 with
-text_only, ~6 with fast_start). Without the env dataset the compile is cold (+15 min).
+The script verifies a pinned official Cloudflare binary, installs vllm-tpu,
+loads the model, compiles its own TPU graphs and serves through a tunnel.
+Credentials are kept out of ntfy; progress is allowlisted and signed. Dataset
+executables and compiled caches are disabled. Startup timings for this hardened
+configuration have not yet been measured. See SECURITY.md for remaining trust.
 """
 import base64
 import collections
@@ -38,12 +30,137 @@ import time
 import urllib.request
 from pathlib import Path
 
+# BEGIN EMBEDDED HARDENING
+"""Standard-library security helpers, also embedded in the standalone TPU script."""
+import hashlib
+import hmac
+import json
+import math
+import os
+import re
+import tempfile
+import time
+import urllib.request
+from pathlib import Path
+
+# https://github.com/cloudflare/cloudflared/releases/tag/2026.8.3
+# Update the version and digest together after checking the official release.
+CLOUDFLARED_VERSION = "2026.8.3"
+CLOUDFLARED_SHA256 = "f29324fe934d1e100617484c78deef803c4dc2cd351d645bbde42e96b4fccc5e"
+CLOUDFLARED_URL = (
+    "https://github.com/cloudflare/cloudflared/releases/download/"
+    f"{CLOUDFLARED_VERSION}/cloudflared-linux-amd64"
+)
+
+
+def download_cloudflared(destination):
+    """Download to a private temporary file; install only after verification.
+
+    Never trust an existing file or a dataset copy. Call in a private directory.
+    A failed download or checksum raises, preventing tunnel startup.
+    """
+    destination = Path(destination)
+    fd, tmp = tempfile.mkstemp(prefix=".download-", dir=destination.parent)
+    try:
+        digest = hashlib.sha256()
+        with os.fdopen(fd, "wb") as out:
+            with urllib.request.urlopen(CLOUDFLARED_URL, timeout=60) as response:
+                while True:
+                    chunk = response.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+                    out.write(chunk)
+            if not hmac.compare_digest(digest.hexdigest(), CLOUDFLARED_SHA256):
+                raise RuntimeError("cloudflared SHA-256 mismatch; refusing to execute")
+            out.flush()
+            os.fsync(out.fileno())
+        os.chmod(tmp, 0o700)
+        os.replace(tmp, destination)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def public_event(phase, extra):
+    """Only allow structured progress metadata, never arbitrary logs or secrets."""
+    if not isinstance(phase, str) or not re.fullmatch(r"[a-z][a-z0-9-]{0,63}", phase):
+        raise ValueError("Invalid progress phase")
+    result = {"phase": phase}
+    for field in ("elapsed_s", "startup_secs", "decode_tok_s", "max_model_len",
+                  "max_num_seqs", "keepalive_min", "up_min", "served_min",
+                  "secs", "entries", "rc"):
+        value = extra.get(field)
+        if type(value) in (int, float) and math.isfinite(value):
+            result[field] = value
+    if type(extra.get("covers_this_config")) is bool:
+        result["covers_this_config"] = extra["covers_this_config"]
+    endpoint = extra.get("endpoint")
+    if isinstance(endpoint, str) and re.fullmatch(
+            r"https://[a-z0-9-]+\.trycloudflare\.com/v1", endpoint):
+        result["endpoint"] = endpoint
+    # Known values only: arbitrary strings can contain credentials or prompt text.
+    if extra.get("model") == "qwen3.8-27b":
+        result["model"] = "qwen3.8-27b"
+    if extra.get("step") in ("install", "server", "health-timeout", "tunnel"):
+        result["step"] = extra["step"]
+    return result
+
+
+def sign_event(event, topic, event_key):
+    if not event_key:
+        raise ValueError("Missing progress signing key")
+    payload = json.dumps({"topic": topic, "time": int(time.time()), "event": event},
+                         sort_keys=True, separators=(",", ":"), allow_nan=False)
+    signature = hmac.new(event_key.encode(), payload.encode(), hashlib.sha256).hexdigest()
+    return json.dumps({"payload": payload, "signature": signature})
+
+
+def verify_event(message, topic, event_key):
+    """Authenticate progress before displaying it; legacy unsigned messages fail closed."""
+    if not event_key or not isinstance(message, str) or len(message) > 16384:
+        return None
+    try:
+        envelope = json.loads(message)
+        payload, signature = envelope["payload"], envelope["signature"]
+        if not isinstance(payload, str) or not isinstance(signature, str):
+            return None
+        expected = hmac.new(event_key.encode(), payload.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(expected, signature):
+            return None
+        data = json.loads(payload)
+        stamp = data["time"]
+        if type(stamp) is not int or not time.time() - 86400 <= stamp <= time.time() + 60:
+            return None
+        if data["topic"] != topic or not isinstance(data["event"], dict):
+            return None
+        event = data["event"]
+        return stamp, public_event(event["phase"], event)
+    except (ValueError, KeyError, TypeError, AttributeError, OverflowError, RecursionError):
+        return None
+
+
+def write_private_state(path, state):
+    """Atomically replace state with a mode-0600 file, without following symlinks."""
+    path = Path(path)
+    fd, tmp = tempfile.mkstemp(prefix=".ktl-state-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w") as out:
+            json.dump(state, out)
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+# END EMBEDDED HARDENING
+
 CFG = None  # __LAUNCHER_CONFIG__  (launch.py replaces this line)
 
 DEFAULTS = {
     "vllm_tpu_version": "0.28.0",
     "weights_dataset": "rahim3/qwen3-8-27b-bf16",     # HF mirror of Qwen/Qwen3.8-27B
-    "env_dataset": "rahim3/qwen38-tpu-env-v5e8",       # XLA cache + cloudflared + manifest
     "hf_model_id": "Qwen/Qwen3.8-27B",                # fallback download source
     "max_model_len": 262144,       # native context; drop to 131072 + max_num_seqs 16 for throughput
     "max_num_seqs": 4,
@@ -58,12 +175,11 @@ DEFAULTS = {
                                    # image inputs then error out)
     "min_token_bucket": 64,        # smallest padded batch (tokens); 16 = more graphs to compile
     "precompile_workers": 4,       # parallel XLA compile threads (1 = sequential)
-    "fast_start": False,           # True: skip precompile -> READY in ~4 min (needs the env
-                                   # dataset's cache); the script then warms the common
-                                   # request shapes itself; rare shapes stall once (~1 min)
+    "fast_start": False,           # Skip initial precompile; first-use shapes compile cold
     "keepalive_min": 480,          # auto-shutdown guard (Kaggle TPU caps at 9h anyway)
     "api_key": "",                 # generated if empty
-    "ntfy_topic": "",              # optional: publish progress to ntfy.sh/<topic>
+    "ntfy_topic": "",              # optional: signed, allowlisted progress only
+    "event_key": "",               # separate HMAC key; never published
     "served_model_name": "qwen3.8-27b",
     "verbose": False,              # show every vLLM log line (always saved to vllm.log)
     "build_bundle": False,         # maintainer mode: build the env dataset instead of serving
@@ -77,12 +193,16 @@ if not CFG["api_key"]:
     CFG["api_key"] = "sk-" + secrets.token_hex(16)
 
 PORT = 8000
-VENV = "/tmp/venv"
+_session = tempfile.TemporaryDirectory(prefix="ktl-")
+SESSION_DIR = Path(_session.name)
+VENV = str(SESSION_DIR / "venv")
 PY = f"{VENV}/bin/python"
-XLA_CACHE = "/tmp/xla_cache"
+XLA_CACHE = str(SESSION_DIR / "xla_cache")
 WORK = Path("/kaggle/working") if Path("/kaggle/working").is_dir() else Path("/tmp")
 RAW_LOG = WORK / "vllm.log"          # every line vLLM/pip print, for debugging
-CLOUDFLARED = Path("/tmp/cloudflared")
+CLOUDFLARED = SESSION_DIR / "cloudflared"
+KEY_FILE = SESSION_DIR / "inference-key.json"
+write_private_state(KEY_FILE, {"api_key": CFG["api_key"]})
 T0 = time.time()
 PY_VER = f"{sys.version_info.major}.{sys.version_info.minor}"
 
@@ -99,8 +219,15 @@ os.environ.pop("TPU_LIBRARY_PATH", None)
 _raw = open(RAW_LOG, "a", buffering=1)
 
 
+def redact(text):
+    for secret in (CFG["api_key"], CFG["event_key"]):
+        if secret:
+            text = text.replace(secret, "[REDACTED]")
+    return text
+
+
 def log(*parts):
-    line = time.strftime("[%H:%M:%S] ") + " ".join(str(p) for p in parts)
+    line = redact(time.strftime("[%H:%M:%S] ") + " ".join(str(p) for p in parts))
     print(line, flush=True)
     _raw.write(line + "\n")
 
@@ -117,18 +244,21 @@ def banner(step, title, note=""):
 
 
 def publish(phase, **extra):
-    """Progress event: always logged; also pushed to ntfy if a topic is set."""
-    log(f"PHASE {phase}", json.dumps(extra) if extra else "")
+    """Send only signed, allowlisted metadata. Logs, prompts and keys stay off ntfy."""
+    event = public_event(phase, extra)
+    log("PHASE", phase, json.dumps(event))
     if not CFG["ntfy_topic"]:
         return
     try:
+        message = sign_event(event, CFG["ntfy_topic"], CFG["event_key"])
         body = {"topic": CFG["ntfy_topic"], "title": f"kaggle-tpu-lab {phase}",
-                "message": json.dumps({"phase": phase, **extra})}
+                "message": message}
         req = urllib.request.Request("https://ntfy.sh", data=json.dumps(body).encode(),
                                      headers={"Content-Type": "application/json"})
-        urllib.request.urlopen(req, timeout=10)
-    except Exception as e:
-        log(f"(ntfy publish failed: {e})")
+        with urllib.request.urlopen(req, timeout=10):
+            pass
+    except Exception:
+        log("(ntfy progress unavailable; inspect the private Kaggle session)")
 
 
 def sh(cmd, tag, show=None, env=None):
@@ -139,7 +269,7 @@ def sh(cmd, tag, show=None, env=None):
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                          text=True, env=env)
     for line in p.stdout:
-        line = line.rstrip()
+        line = redact(line.rstrip())
         if not line:
             continue
         tail.append(line)
@@ -164,15 +294,8 @@ def find_input(*patterns):
 
 
 def fetch_cloudflared():
-    if CLOUDFLARED.exists():
-        return
-    try:
-        urllib.request.urlretrieve(
-            "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64",
-            CLOUDFLARED)
-        CLOUDFLARED.chmod(0o755)
-    except Exception as e:
-        log(f"(cloudflared download failed: {e})")
+    download_cloudflared(CLOUDFLARED)
+    log("   verified official cloudflared", CLOUDFLARED_VERSION)
 
 
 # gzip+base64 of patches/mtp-rollback-v0280.diff; regenerated by tools/embed_patch.py
@@ -192,7 +315,7 @@ def apply_mtp_patch():
     pkg_root = os.path.dirname(os.path.dirname(origin))
     p = subprocess.run(["patch", "-p1", "-d", pkg_root, "-i", "/tmp/mtpfix.diff",
                         "--no-backup-if-mismatch", "-N"], capture_output=True, text=True)
-    _raw.write(p.stdout + p.stderr)
+    _raw.write(redact(p.stdout + p.stderr))
     if p.returncode == 0 or "previously applied" in p.stdout:
         return True
     log(p.stdout[-1500:], p.stderr[-500:])
@@ -237,33 +360,14 @@ def install_runtime(built=None):
 
 # ---------------- 1. runtime ----------------
 banner(1, "Python runtime", f"vllm-tpu {CFG['vllm_tpu_version']}")
-threading.Thread(target=fetch_cloudflared, daemon=True).start()
-bundle_root = find_input(CFG["env_dataset"].split("/")[-1], "qwen38-tpu-env*")
-bundle, manifest = None, {}
-if bundle_root:
-    # Kaggle may keep the files at the top level or under the kernel's output folder
-    hits = glob.glob(f"{bundle_root}/manifest.json") + glob.glob(f"{bundle_root}/*/manifest.json")
-    if hits:
-        bundle = os.path.dirname(hits[0])
-        manifest = json.loads(Path(hits[0]).read_text())
-    else:
-        bundle = bundle_root
-if bundle and Path(bundle, "cloudflared").exists() and not CLOUDFLARED.exists():
-    shutil.copy(Path(bundle, "cloudflared"), CLOUDFLARED)
-    CLOUDFLARED.chmod(0o755)
-if manifest and (manifest.get("python") != PY_VER
-                 or manifest.get("vllm_tpu_version") != CFG["vllm_tpu_version"]):
-    log(f"   env dataset was built for python {manifest.get('python')} / vllm-tpu "
-        f"{manifest.get('vllm_tpu_version')}; this session has python {PY_VER} and wants "
-        f"vllm-tpu {CFG['vllm_tpu_version']} -> its compile cache will not match")
-    manifest = {}
-if not bundle:
-    log(f"   env dataset not attached (expected {CFG['env_dataset']}) -> cold compile later")
+# Verify the tunnel binary before spending time installing or compiling.
+# Failure aborts this run; no dataset or existing-file fallback is permitted.
+fetch_cloudflared()
 
 t = time.time()
 publish("install", vllm_tpu=CFG["vllm_tpu_version"])
 log("   installer output goes to", RAW_LOG)
-runtime = install_runtime(manifest.get("built"))
+runtime = install_runtime()
 if runtime is None or not runtime_ok():
     publish("failed", step="install")
     sys.exit(1)
@@ -276,31 +380,11 @@ elif CFG["mtp_tokens"] > 0:
 log(f"   runtime ready in {int(time.time() - t)} s")
 
 # ---------------- 2. XLA compile cache ----------------
-banner(2, "XLA compile cache")
-t = time.time()
-cache_tar = (Path(bundle, "xla_cache.tar") if bundle and Path(bundle, "xla_cache.tar").exists()
-             else find_input("*/xla_cache*.tar.gz", "xla_cache*.tar.gz"))
-cache_dir = find_input("*/*/xla_cache", "*/xla_cache", "xla_cache")
-if cache_tar:
-    flags = "-xf" if str(cache_tar).endswith(".tar") else "-xzf"
-    sh(["tar", flags, str(cache_tar), "-C", "/tmp"], "tar")
-elif cache_dir:
-    sh(["cp", "-r", cache_dir, "/tmp/"], "cp")
-    sh(["chmod", "-R", "u+w", XLA_CACHE], "chmod")
-n_entries = len(glob.glob(XLA_CACHE + "/*"))
-cache_configs = manifest.get("configs", [])
-this_config = [CFG["max_model_len"], CFG["max_num_seqs"], CFG["mtp_tokens"], CFG["text_only"]]
-if n_entries:
-    covered = (not cache_configs) or (this_config in cache_configs)
-    publish("cache-restored", entries=n_entries, secs=int(time.time() - t),
-            covers_this_config=covered)
-    if not covered:
-        log(f"   note: the cache was built for [ctx, seqs, mtp, text_only] in {cache_configs}; "
-            f"this run uses {this_config} -> its graphs compile cold (add ~10-15 min)")
-    else:
-        log("   compiled TPU graphs for this exact config are cached -> fast start")
-else:
-    publish("cache-missing", note="cold compile: expect ~10 extra minutes")
+banner(2, "Fresh XLA compile cache")
+Path(XLA_CACHE).mkdir(mode=0o700)
+n_entries = 0
+publish("cache-missing")
+log("   dataset compile caches are disabled; TPU graphs will compile in this session")
 
 # ---------------- 3. weights ----------------
 banner(3, "Model weights", "55 GB bf16 safetensors")
@@ -332,6 +416,7 @@ def server_args(cfg):
             "--tensor-parallel-size", "8",
             "--max-model-len", str(cfg["max_model_len"]),
             "--max-num-seqs", str(cfg["max_num_seqs"]),
+            "--host", "127.0.0.1",
             "--port", str(PORT),
             "--api-key", cfg["api_key"],
             "--served-model-name", cfg["served_model_name"],
@@ -444,7 +529,7 @@ def launch_server(cfg):
 
     def pump():
         for line in p.stdout:
-            line = line.rstrip()
+            line = redact(line.rstrip())
             if line:
                 tail.append(line)
                 _raw.write(f"[vllm] {line}\n")
@@ -671,10 +756,7 @@ if CFG["build_bundle"]:
     banner(5, "packing the bundle", str(out))
     # (no venv tarball: uv rebuilds the identical env in ~30 s, and Kaggle would
     #  unpack a tar into 100k files anyway — some with '[' in the name, which it rejects)
-    sh(["tar", "-cf", str(out / "xla_cache.tar"), "-C", "/tmp", "xla_cache"], "tar")
-    fetch_cloudflared()
-    if CLOUDFLARED.exists():
-        shutil.copy(CLOUDFLARED, out / "cloudflared")
+    sh(["tar", "-cf", str(out / "xla_cache.tar"), "-C", str(SESSION_DIR), "xla_cache"], "tar")
     pkgs = subprocess.run([sys.executable, "-m", "uv", "pip", "list", "--python", PY,
                            "--format=json"], capture_output=True, text=True)
     try:
@@ -704,7 +786,7 @@ if CFG["fast_start"]:
     expect_min = 5 if n_entries else 7
     if not n_entries:
         log("   fast_start without a compile cache: every new request shape will compile "
-            "cold (~1 min each) — attach the env dataset for this mode to make sense")
+            "cold; dataset caches are disabled in this fork")
 banner(4, "Starting vLLM", f"TP=8, ctx {CFG['max_model_len']}, {CFG['max_num_seqs']} seqs, "
        f"MTP k={CFG['mtp_tokens']}, {'text-only' if CFG['text_only'] else 'multimodal'}")
 log(f"   expect ~{expect_min} min; progress lines below, full vLLM log in {RAW_LOG}")
@@ -714,10 +796,11 @@ server = launch_server(CFG)
 banner(5, "Public URL")
 url = None
 tunnel = None
-for _ in range(60):  # cloudflared download runs in the background from step 1
-    if CLOUDFLARED.exists():
-        break
-    time.sleep(2)
+# Recheck immediately before execution as well as during installation.
+if not hmac.compare_digest(hashlib.sha256(CLOUDFLARED.read_bytes()).hexdigest(),
+                           CLOUDFLARED_SHA256):
+    stop_server(server)
+    raise RuntimeError("cloudflared changed after verification; refusing to execute")
 if CLOUDFLARED.exists():
     tunnel = subprocess.Popen([str(CLOUDFLARED), "tunnel", "--url", f"http://127.0.0.1:{PORT}",
                                "--no-autoupdate", "--protocol", "quic"],
@@ -752,18 +835,19 @@ log("")
 log("#" * 70)
 log(f"#  READY — the server is live ({elapsed()} after start)")
 log(f"#  ENDPOINT : {url + '/v1' if url else 'http://127.0.0.1:8000/v1 (tunnel failed)'}")
-log(f"#  API KEY  : {CFG['api_key']}")
+log(f"#  API key is in private file: {KEY_FILE}")
+log("#  CLI users: the launcher displays its locally saved key.")
 log(f"#  MODEL    : {CFG['served_model_name']}   (context {CFG['max_model_len']}, "
     f"{CFG['max_num_seqs']} parallel requests)")
 log("#" * 70)
 log("#  Try it:")
 log(f"#    curl {url + '/v1' if url else 'http://127.0.0.1:8000/v1'}/chat/completions \\")
-log(f"#      -H 'Authorization: Bearer {CFG['api_key']}' -H 'Content-Type: application/json' \\")
+log('#      -H "Authorization: Bearer $INFERENCE_API_KEY" -H "Content-Type: application/json" \\')
 log("#      -d '{\"model\": \"" + CFG["served_model_name"] + "\", \"messages\": [{\"role\": \"user\", "
     "\"content\": \"Hello!\"}], \"chat_template_kwargs\": {\"reasoning_effort\": \"low\"}}'")
 log(f"#  Serving for up to {CFG['keepalive_min']} min, then this cell exits on its own.")
 log("#" * 70)
-publish("ready", endpoint=(f"{url}/v1" if url else None), api_key=CFG["api_key"],
+publish("ready", endpoint=(f"{url}/v1" if url else None),
         model=CFG["served_model_name"], max_model_len=CFG["max_model_len"],
         keepalive_min=CFG["keepalive_min"], startup_secs=startup)
 

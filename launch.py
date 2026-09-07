@@ -22,13 +22,13 @@ import time
 import urllib.request
 import uuid
 from pathlib import Path
+from hardening import verify_event, write_private_state
 
 HERE = Path(__file__).resolve().parent
 KERNEL_SRC = HERE / "kernel" / "serve_qwen38.py"
 STATE_FILE = Path.home() / ".kaggle-tpu-lab.json"
 
 WEIGHTS_DATASET = "rahim3/qwen3-8-27b-bf16"
-ENV_DATASET = "rahim3/qwen38-tpu-env-v5e8"   # XLA compile cache + cloudflared + manifest
 
 # Friendly one-liners for each phase the kernel publishes.
 PHASE_TEXT = {
@@ -37,7 +37,7 @@ PHASE_TEXT = {
     "mtp-patch-applied":  "MTP state-rollback patch applied.",
     "mtp-patch-failed":   "MTP patch did not apply — speculative decoding disabled for safety.",
     "cache-restored":     None,  # rendered below (depends on config coverage)
-    "cache-missing":      "No compile cache found — cold compile, add ~10 min.",
+    "cache-missing":      "Compiling fresh TPU graphs; dataset caches are disabled.",
     "weights-mounted":    "Weights found mounted (no download needed).",
     "weights-download":   "Downloading weights from Hugging Face (~5 min)...",
     "weights-downloaded": "Weights downloaded.",
@@ -89,9 +89,11 @@ def cmd_serve(args):
     slug = args.slug
     topic = "ktl-" + uuid.uuid4().hex[:20]
     api_key = "sk-" + secrets.token_hex(16)
+    event_key = secrets.token_hex(32)
 
     cfg = {
         "ntfy_topic": topic,
+        "event_key": event_key,
         "api_key": api_key,
         "max_model_len": args.max_model_len,
         "max_num_seqs": args.max_num_seqs,
@@ -128,10 +130,13 @@ def cmd_serve(args):
             "enable_gpu": "false",
             "enable_tpu": "true",
             "enable_internet": "true",
-            "dataset_sources": [args.weights_dataset, ENV_DATASET],
+            "dataset_sources": [args.weights_dataset],
             "competition_sources": [], "kernel_sources": [], "model_sources": [],
         }, indent=1))
         say(f"Pushing kernel {user}/{slug} (TPU v5e-8)...")
+        write_private_state(STATE_FILE, {
+            "kernel": f"{user}/{slug}", "topic": topic,
+            "api_key": api_key, "event_key": event_key})
         r = kaggle("kernels", "push", "-p", str(td))
         out = (r.stdout or "") + (r.stderr or "")
         if "successfully pushed" not in out:
@@ -141,20 +146,18 @@ def cmd_serve(args):
                 say(f"WARNING: {line.strip()} — the kernel will still run, "
                     "but may need to download weights / compile cold.")
 
-    STATE_FILE.write_text(json.dumps(
-        {"kernel": f"{user}/{slug}", "topic": topic, "api_key": api_key}))
     say("Pushed. Kaggle takes a few minutes to provision the TPU and attach the "
-        "datasets; the endpoint is usually live ~22 min after the kernel starts.")
+        "weights; this fork compiles locally on the TPU and does not load dataset caches.")
     say("Watching progress (Ctrl-C is safe — the server keeps running; "
         "`python launch.py status` re-attaches, `... stop` kills it).")
-    watch(f"{user}/{slug}", topic)
+    watch(f"{user}/{slug}", topic, event_key, api_key)
 
 
-def read_events(topic, since):
+def read_events(topic, since, event_key):
     try:
         with urllib.request.urlopen(
                 f"https://ntfy.sh/{topic}/json?poll=1&since={since}", timeout=15) as r:
-            body = r.read().decode()
+            body = r.read(1024 * 1024).decode()
     except Exception:
         return []
     events = []
@@ -163,20 +166,19 @@ def read_events(topic, since):
             e = json.loads(line)
         except Exception:
             continue
-        if e.get("event") != "message":
+        if not isinstance(e, dict) or e.get("event") != "message":
             continue
-        try:
-            events.append((e["time"], json.loads(e.get("message", "{}"))))
-        except Exception:
-            continue
+        verified = verify_event(e.get("message"), topic, event_key)
+        if verified is not None:
+            events.append(verified)
     return events
 
 
-def render_event(ev):
+def render_event(ev, api_key=""):
     phase = ev.get("phase", "?")
     if phase == "compiling":
         say(f"Loading / compiling... {ev.get('elapsed_s', 0) // 60} min elapsed "
-            "(typically ~20 min with the env dataset, ~35 min without)")
+            "(cold compilation; startup timing has not been measured for this fork)")
     elif phase == "cache-restored":
         if ev.get("covers_this_config", True):
             say("XLA compile cache restored for this exact config — fast start.")
@@ -193,9 +195,9 @@ def render_event(ev):
     elif phase == "ready":
         print("\n" + "=" * 66)
         print("  YOUR ENDPOINT IS LIVE")
-        print(f"  base URL : {ev['endpoint']}")
-        print(f"  API key  : {ev['api_key']}")
-        print(f"  model    : {ev['model']}   (context: {ev.get('max_model_len', '?')})")
+        print(f"  base URL : {ev.get('endpoint', 'Tunnel unavailable; see private Kaggle session')}")
+        print(f"  API key  : {api_key}")
+        print(f"  model    : {ev.get('model', 'qwen3.8-27b')}   (context: {ev.get('max_model_len', '?')})")
         print("=" * 66)
         print("""
 Try it:
@@ -224,16 +226,16 @@ See the README for hooking this into Claude Code, Codex CLI, opencode, etc.
         say(text if text else f"{phase} {json.dumps({k: v for k, v in ev.items() if k != 'phase'})}")
 
 
-def watch(kernel, topic):
+def watch(kernel, topic, event_key, api_key=""):
     since = int(time.time()) - 600
     last_status = None
     seen_boot = False
     try:
         while True:
-            for ts, ev in read_events(topic, since):
+            for ts, ev in read_events(topic, since, event_key):
                 since = max(since, ts)
                 seen_boot = True
-                render_event(ev)
+                render_event(ev, api_key)
                 if ev.get("phase") in ("failed", "auto-shutdown", "stopped"):
                     return
             since = max(since, int(time.time()) - 1) if seen_boot else since
@@ -264,7 +266,9 @@ def cmd_build_env(args):
     check_auth()
     user = kaggle_username(args.user)
     topic = "ktl-" + uuid.uuid4().hex[:20]
-    cfg = {"build_bundle": True, "ntfy_topic": topic, "weights_dataset": args.weights_dataset}
+    event_key = secrets.token_hex(32)
+    cfg = {"build_bundle": True, "ntfy_topic": topic, "event_key": event_key,
+           "weights_dataset": args.weights_dataset}
     src = KERNEL_SRC.read_text()
     src, n = re.subn(r"^CFG = None  # __LAUNCHER_CONFIG__.*$",
                      f"CFG = {cfg!r}", src, count=1, flags=re.M)
@@ -280,15 +284,15 @@ def cmd_build_env(args):
             "dataset_sources": [args.weights_dataset],
             "competition_sources": [], "kernel_sources": [], "model_sources": [],
         }, indent=1))
+        write_private_state(STATE_FILE, {"kernel": f"{user}/{args.slug}", "topic": topic,
+                                        "api_key": "", "event_key": event_key})
         r = kaggle("kernels", "push", "-p", str(td))
         out = (r.stdout or "") + (r.stderr or "")
         if "successfully pushed" not in out:
             sys.exit(f"Push failed:\n{out.strip()}")
-    STATE_FILE.write_text(json.dumps({"kernel": f"{user}/{args.slug}", "topic": topic,
-                                      "api_key": ""}))
     say(f"Pushed {user}/{args.slug}. It serves each config once (~1.5 h total) and "
-        "leaves xla_cache.tar / cloudflared / manifest.json in its output.")
-    watch(f"{user}/{args.slug}", topic)
+        "leaves xla_cache.tar / manifest.json in its output (not imported by serving).")
+    watch(f"{user}/{args.slug}", topic, event_key)
 
 
 def load_state():
@@ -302,13 +306,15 @@ def cmd_status(args):
     say(f"Kernel: {st['kernel']}")
     r = kaggle("kernels", "status", st["kernel"])
     say(((r.stdout or "") + (r.stderr or "")).strip())
-    events = read_events(st["topic"], int(time.time()) - 24 * 3600)
+    if not st.get("event_key"):
+        sys.exit("Legacy launch: unsigned progress is disabled. Stop and relaunch with this fork.")
+    events = read_events(st["topic"], int(time.time()) - 24 * 3600, st["event_key"])
     for _, ev in events[-8:]:
-        render_event(ev)
+        render_event(ev, st["api_key"])
     if any(ev.get("phase") == "ready" for _, ev in events):
         say(f"API key: {st['api_key']}")
     if args.follow:
-        watch(st["kernel"], st["topic"])
+        watch(st["kernel"], st["topic"], st["event_key"], st["api_key"])
 
 
 def cmd_stop(args):
@@ -349,13 +355,11 @@ def main():
     s.add_argument("--verbose", action="store_true",
                    help="show every vLLM log line in the kernel log")
     s.add_argument("--fast-start", action="store_true",
-                   help="skip TPU graph precompile: endpoint live in ~4 min (with the env "
-                        "dataset), common request shapes are warmed right after; an "
-                        "unusual request shape stalls ~1 min the first time")
+                   help="skip initial TPU graph precompile; uncached request shapes compile "
+                        "on first use and may time out")
     s.set_defaults(fn=cmd_serve)
 
-    s = sub.add_parser("build-env", help="(maintainers) push a kernel that builds the "
-                       "env dataset: venv + XLA cache + cloudflared")
+    s = sub.add_parser("build-env", help="(maintainers) export compiled graphs and build metadata")
     s.add_argument("--user", help="Kaggle username (auto-detected if possible)")
     s.add_argument("--slug", default="qwen38-env-bundle")
     s.add_argument("--weights-dataset", default=WEIGHTS_DATASET)

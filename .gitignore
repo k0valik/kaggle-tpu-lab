@@ -3,3 +3,8 @@ __pycache__/
 .DS_Store
 out/
 *.log
+work/
+.venv/
+serve_config.json
+inference-key.json
+.kaggle-tpu-lab.json
