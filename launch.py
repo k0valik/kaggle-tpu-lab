@@ -54,6 +54,12 @@ PHASE_TEXT = {
 }
 
 
+def write_state(payload):
+    """Persist launcher state without leaving the generated API key world-readable."""
+    STATE_FILE.write_text(json.dumps(payload))
+    STATE_FILE.chmod(0o600)
+
+
 def kaggle(*args, capture=True):
     cmd = [sys.executable, "-m", "kaggle", *args]
     r = subprocess.run(cmd, capture_output=capture, text=True)
@@ -141,8 +147,7 @@ def cmd_serve(args):
                 say(f"WARNING: {line.strip()} — the kernel will still run, "
                     "but may need to download weights / compile cold.")
 
-    STATE_FILE.write_text(json.dumps(
-        {"kernel": f"{user}/{slug}", "topic": topic, "api_key": api_key}))
+    write_state({"kernel": f"{user}/{slug}", "topic": topic, "api_key": api_key})
     say("Pushed. Kaggle takes a few minutes to provision the TPU and attach the "
         "datasets; the endpoint is usually live ~22 min after the kernel starts.")
     say("Watching progress (Ctrl-C is safe — the server keeps running; "
@@ -284,8 +289,7 @@ def cmd_build_env(args):
         out = (r.stdout or "") + (r.stderr or "")
         if "successfully pushed" not in out:
             sys.exit(f"Push failed:\n{out.strip()}")
-    STATE_FILE.write_text(json.dumps({"kernel": f"{user}/{args.slug}", "topic": topic,
-                                      "api_key": ""}))
+    write_state({"kernel": f"{user}/{args.slug}", "topic": topic, "api_key": ""})
     say(f"Pushed {user}/{args.slug}. It serves each config once (~1.5 h total) and "
         "leaves xla_cache.tar / cloudflared / manifest.json in its output.")
     watch(f"{user}/{args.slug}", topic)

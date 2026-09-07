@@ -1,0 +1,26 @@
+name: checks
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Check generated notebook
+        run: python tools/sync_notebook.py --check
+      - name: Compile Python sources
+        run: python -m py_compile launch.py kernel/serve_qwen38.py tools/*.py
+      - name: Parse JSON artifacts
+        run: >-
+          python -c "import json, pathlib;
+          [json.loads(pathlib.Path(p).read_text()) for p in
+          ('notebook/qwen38-tpu-serve.ipynb', 'notebook/kernel-metadata.json')]"

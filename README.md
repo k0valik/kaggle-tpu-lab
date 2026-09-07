@@ -1,5 +1,12 @@
 # kaggle-tpu-lab
 
+> **Public reviewed fork.** The runnable Kaggle notebook is
+> [keithvo/qwen3-8-27b-bf16-on-kaggle-tpu-130-tok-s-api](https://www.kaggle.com/code/keithvo/qwen3-8-27b-bf16-on-kaggle-tpu-130-tok-s-api).
+> Runtime code is based on the MIT-licensed
+> [ARahim3/kaggle-tpu-lab](https://github.com/ARahim3/kaggle-tpu-lab). See the
+> [input audit](docs/INPUT_AUDIT.md) for the three-notebook comparison and the
+> decisions behind this synthesis.
+
 **Serve Qwen3.8-27B — a frontier-class 27B hybrid-attention model — on Kaggle's free
 TPU v5e-8, with a public OpenAI-compatible endpoint you can plug into Claude Code,
 Codex CLI, opencode, or anything else that speaks the OpenAI API.**
@@ -34,12 +41,15 @@ and a tunnel to the outside world.
 
 ## Quick start A — as a Kaggle notebook
 
-**Copy & Edit** the published Kaggle notebook and Run it —
-[**kaggle.com/code/rahim3/qwen3-8-27b-bf16-on-kaggle-tpu-130-tok-s-api**](https://www.kaggle.com/code/rahim3/qwen3-8-27b-bf16-on-kaggle-tpu-130-tok-s-api)
+**Copy & Edit** this fork's public Kaggle notebook and Run it —
+[**kaggle.com/code/keithvo/qwen3-8-27b-bf16-on-kaggle-tpu-130-tok-s-api**](https://www.kaggle.com/code/keithvo/qwen3-8-27b-bf16-on-kaggle-tpu-130-tok-s-api)
 — or upload [`notebook/qwen38-tpu-serve.ipynb`](notebook/qwen38-tpu-serve.ipynb) yourself.
 Set **Accelerator = TPU VM v5e-8**, **Internet = ON**, attach the two datasets named in
 the first cell, and run top to bottom. The last cell *is* the server — the endpoint URL
 and API key appear in its output.
+
+The original author's notebook remains available at
+[rahim3/qwen3-8-27b-bf16-on-kaggle-tpu-130-tok-s-api](https://www.kaggle.com/code/rahim3/qwen3-8-27b-bf16-on-kaggle-tpu-130-tok-s-api).
 
 ## Quick start B — from your terminal
 
@@ -53,7 +63,7 @@ pip install kaggle
 #   Linux/macOS: ~/.kaggle/kaggle.json     Windows: %USERPROFILE%\.kaggle\kaggle.json
 
 # 2. Get this repo and launch
-git clone https://github.com/ARahim3/kaggle-tpu-lab
+git clone https://github.com/Kitkitkittt/kaggle-tpu-lab
 cd kaggle-tpu-lab
 python launch.py serve
 ```
@@ -146,6 +156,8 @@ kernel/serve_qwen38.py           the Kaggle kernel: runtime → cache → weight
 notebook/qwen38-tpu-serve.ipynb  the same flow as a run-it-yourself notebook
 patches/mtp-rollback-v0280.diff  GDN state-rollback fix (port of tpu-inference PR #3178)
 tools/embed_patch.py             re-embeds the patch into the kernel script after edits
+tools/sync_notebook.py           regenerates/checks the notebook from the kernel script
+docs/INPUT_AUDIT.md              records what was and was not synthesized from the inputs
 ```
 
 Plus two public Kaggle datasets the kernel attaches:

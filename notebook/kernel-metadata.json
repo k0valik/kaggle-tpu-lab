@@ -1,0 +1,19 @@
+{
+  "id": "keithvo/qwen3-8-27b-bf16-on-kaggle-tpu-130-tok-s-api",
+  "title": "Qwen3.8-27B-bf16 on Kaggle TPU: 130 tok/s API",
+  "code_file": "qwen38-tpu-serve.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": "false",
+  "enable_gpu": "false",
+  "enable_tpu": "true",
+  "enable_internet": "true",
+  "machine_shape": "TpuV5E8",
+  "dataset_sources": [
+    "rahim3/qwen3-8-27b-bf16",
+    "rahim3/qwen38-tpu-env-v5e8"
+  ],
+  "competition_sources": [],
+  "kernel_sources": [],
+  "model_sources": []
+}
