@@ -1,0 +1,16 @@
+{
+  "id": "keithvo/qwen3-8-27b-on-free-kaggle-gpu-t4-x2-api",
+  "title": "Qwen3.8-27B on Free Kaggle GPU T4 x2 API",
+  "code_file": "qwen38-t4x2-serve.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": "false",
+  "enable_gpu": "true",
+  "enable_tpu": "false",
+  "enable_internet": "true",
+  "machine_shape": "NvidiaTeslaT4",
+  "dataset_sources": [],
+  "competition_sources": [],
+  "kernel_sources": [],
+  "model_sources": []
+}

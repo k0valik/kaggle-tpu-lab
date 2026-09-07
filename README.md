@@ -1,20 +1,33 @@
 # kaggle-tpu-lab
 
-> **Public reviewed fork.** The runnable Kaggle notebook is
-> [keithvo/qwen3-8-27b-bf16-on-kaggle-tpu-130-tok-s-api](https://www.kaggle.com/code/keithvo/qwen3-8-27b-bf16-on-kaggle-tpu-130-tok-s-api).
-> Open that page, click **Copy & Edit**, and follow the numbered beginner guide;
-> the public view itself is read-only.
+> **Public reviewed fork.** Choose the
+> [TPU v5e-8 bf16 notebook](https://www.kaggle.com/code/keithvo/qwen3-8-27b-bf16-on-kaggle-tpu-130-tok-s-api)
+> or the [GPU T4 ×2 Q4 notebook](https://www.kaggle.com/code/keithvo/qwen3-8-27b-on-free-kaggle-gpu-t4-x2-api).
+> Open either page, click **Copy & Edit**, and follow its numbered guide; the
+> public view itself is read-only.
 > Runtime code is based on the MIT-licensed
 > [ARahim3/kaggle-tpu-lab](https://github.com/ARahim3/kaggle-tpu-lab). See the
 > [input audit](docs/INPUT_AUDIT.md) for the three-notebook comparison and the
 > decisions behind this synthesis.
 
-**Serve Qwen3.8-27B — a frontier-class 27B hybrid-attention model — on Kaggle's free
-TPU v5e-8, with a public OpenAI-compatible endpoint you can plug into Claude Code,
-Codex CLI, opencode, or anything else that speaks the OpenAI API.**
+**Serve Qwen3.8-27B — a frontier-class 27B hybrid-attention model — on either
+Kaggle's free TPU v5e-8 or its two free Tesla T4 GPUs, with a temporary
+OpenAI-compatible endpoint.**
 
-No paid GPU, no cloud account, no quantization. Full bf16 weights, up to the model's
-native **262,144-token context**, and real speed:
+## Choose your Kaggle hardware
+
+| Path | Model format | Context in beginner guide | Best reason to choose it |
+|---|---|---:|---|
+| [TPU v5e-8](https://www.kaggle.com/code/keithvo/qwen3-8-27b-bf16-on-kaggle-tpu-130-tok-s-api) | Full bf16 safetensors (~55 GB) | 262k | Highest documented speed and full precision; requires working TPU access and two attached datasets |
+| [GPU T4 ×2](https://www.kaggle.com/code/keithvo/qwen3-8-27b-on-free-kaggle-gpu-t4-x2-api) | Q4_K_M GGUF (~15.3 GiB) | 32k | More widely available hardware and simpler llama.cpp runtime; downloads the model each fresh session |
+
+![Kaggle Settings menu showing Internet enabled and both accelerator choices](notebook/assets/kaggle-settings-internet-accelerator.png)
+
+In Kaggle's menu, **Turn off internet** means Internet is currently enabled.
+Select **TPU v5e-8** for the TPU notebook or **GPU T4 ×2** for the GPU notebook.
+
+The TPU path needs no paid GPU, cloud account, or quantization. It uses full bf16
+weights, up to the model's native **262,144-token context**, with upstream-reported speed:
 
 | What | Measured (TPU v5e-8, bf16, TP=8) |
 |---|---|
@@ -41,7 +54,7 @@ puts it all together on Kaggle's free tier: a pre-built Python runtime with pinn
 versions, pre-mirrored weights, a pre-built XLA compile cache, MTP speculative decoding,
 and a tunnel to the outside world.
 
-## Quick start A — as a Kaggle notebook
+## Quick start A — TPU v5e-8 notebook
 
 Open this fork's public Kaggle notebook, click **Copy & Edit**, and follow its
 numbered hardware, input, configuration, launch, and API-test steps —
@@ -60,7 +73,17 @@ The kernel now stops before loading 55 GB of weights in this situation.
 The original author's notebook remains available at
 [rahim3/qwen3-8-27b-bf16-on-kaggle-tpu-130-tok-s-api](https://www.kaggle.com/code/rahim3/qwen3-8-27b-bf16-on-kaggle-tpu-130-tok-s-api).
 
-## Quick start B — from your terminal
+## Quick start B — GPU T4 ×2 notebook
+
+Open the [public dual-T4 notebook](https://www.kaggle.com/code/keithvo/qwen3-8-27b-on-free-kaggle-gpu-t4-x2-api),
+click **Copy & Edit**, set **Accelerator = GPU T4 ×2** and **Internet = ON**, then
+run its hardware check. It downloads the checksum-pinned Q4_K_M GGUF to
+`/tmp/qwen38-gpu`, splits model layers evenly across the two GPUs with llama.cpp,
+starts an authenticated server, and prints the temporary endpoint after a local
+self-test. This GPU path is quantized and defaults to a 32k context; it is not a
+bf16 substitute for the TPU benchmark.
+
+## Quick start C — TPU from your terminal
 
 You need Python 3.9+ and a Kaggle account with **TPU access** (Settings → phone-verify
 your account if you haven't; free tier includes ~20 TPU hours/week).
@@ -162,10 +185,14 @@ or turn thinking off entirely with `{"enable_thinking": false}`. To change the
 ```
 launch.py                        the CLI: serve / status / stop, with live progress
 kernel/serve_qwen38.py           the Kaggle kernel: runtime → cache → weights → vLLM → tunnel → READY
+kernel/serve_qwen38_gpu.py       dual-T4 Q4 server: verify → download → llama.cpp → tunnel → READY
 notebook/qwen38-tpu-serve.ipynb  the same flow as a run-it-yourself notebook
+notebook/gpu/qwen38-t4x2-serve.ipynb  generated beginner notebook for GPU T4 ×2
+notebook/assets/                 screenshots used by both setup guides
 patches/mtp-rollback-v0280.diff  GDN state-rollback fix (port of tpu-inference PR #3178)
 tools/embed_patch.py             re-embeds the patch into the kernel script after edits
 tools/sync_notebook.py           regenerates/checks the notebook from the kernel script
+tools/sync_gpu_notebook.py       regenerates/checks the dual-T4 notebook
 docs/INPUT_AUDIT.md              records what was and was not synthesized from the inputs
 ```
 

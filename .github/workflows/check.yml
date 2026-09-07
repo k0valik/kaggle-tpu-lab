@@ -16,11 +16,16 @@ jobs:
         with:
           python-version: "3.12"
       - name: Check generated notebook
-        run: python tools/sync_notebook.py --check
+        run: |
+          python tools/sync_notebook.py --check
+          python tools/sync_gpu_notebook.py --check
       - name: Compile Python sources
-        run: python -m py_compile launch.py kernel/serve_qwen38.py tools/*.py
+        run: python -m py_compile launch.py kernel/*.py tools/*.py tests/*.py
+      - name: Run focused regression tests
+        run: python -m unittest discover -s tests -v
       - name: Parse JSON artifacts
         run: >-
           python -c "import json, pathlib;
           [json.loads(pathlib.Path(p).read_text()) for p in
-          ('notebook/qwen38-tpu-serve.ipynb', 'notebook/kernel-metadata.json')]"
+          ('notebook/qwen38-tpu-serve.ipynb', 'notebook/kernel-metadata.json',
+          'notebook/gpu/qwen38-t4x2-serve.ipynb', 'notebook/gpu/kernel-metadata.json')]"

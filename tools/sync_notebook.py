@@ -67,6 +67,12 @@ The public notebook page is read-only. Do this before running any cell:
 If an input is missing, click **+ Add Input**, search for the exact identifier,
 and add it. Copied notebooks normally inherit the inputs, but verify them anyway.
 
+![Kaggle Settings menu showing Internet enabled and the accelerator choices](https://raw.githubusercontent.com/Kitkitkittt/kaggle-tpu-lab/main/notebook/assets/kaggle-settings-internet-accelerator.png)
+
+In the first panel, **Turn off internet** means Internet is already **on**. In
+the second panel, select **TPU v5e-8** for this notebook. The **GPU T4 x2** item
+is for the separate GPU notebook linked from the repository README.
+
 Now run the next cell only. It is a fast hardware check; do not use **Run All**
 until it prints the green success message.
 """

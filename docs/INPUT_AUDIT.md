@@ -15,7 +15,8 @@ commit `10897e5799c0d911d5c81b4f2f932619f02620bd` is the runtime baseline.
 
 ## Synthesis decisions
 
-- Use bf16 safetensors and vLLM TPU; do not mix in GGUF/CUDA commands.
+- Keep the hardware paths separate: bf16 safetensors with vLLM TPU in the TPU
+  notebook, and a Q4_K_M GGUF with CUDA llama.cpp in the dual-T4 notebook.
 - Attach the upstream public weights and environment datasets. Falling back to a
   Hugging Face download remains supported when the weights dataset is unavailable.
 - Generate the notebook from `kernel/serve_qwen38.py` using
@@ -27,6 +28,10 @@ commit `10897e5799c0d911d5c81b4f2f932619f02620bd` is the runtime baseline.
   MTP if that patch cannot be applied.
 - Generate a fresh inference API key for every run. Never place a Kaggle access
   token, Cloudflare account secret, or fixed inference key in a cell or commit.
+- For the GPU alternative, retain the useful scratch-storage and dual-GPU ideas
+  from the supplied notebooks, but pin and checksum the runtime/model downloads,
+  default to a reliability-first 32k context, use a temporary Quick Tunnel, and
+  reject CPU/single-GPU/P100 sessions before downloading 15.3 GiB.
 - Attribute performance figures to the original project. This fork does not claim
   an independent benchmark until a full Kaggle TPU run completes.
 
@@ -34,6 +39,8 @@ commit `10897e5799c0d911d5c81b4f2f932619f02620bd` is the runtime baseline.
 
 ```bash
 python tools/sync_notebook.py --check
-python -m py_compile launch.py kernel/serve_qwen38.py tools/*.py
-jq empty notebook/qwen38-tpu-serve.ipynb notebook/kernel-metadata.json
+python tools/sync_gpu_notebook.py --check
+python -m py_compile launch.py kernel/*.py tools/*.py
+jq empty notebook/qwen38-tpu-serve.ipynb notebook/kernel-metadata.json \
+  notebook/gpu/qwen38-t4x2-serve.ipynb notebook/gpu/kernel-metadata.json
 ```
