@@ -45,6 +45,8 @@ DEFAULTS = {
     "weights_dataset": "rahim3/qwen3-8-27b-bf16",     # HF mirror of Qwen/Qwen3.8-27B
     "env_dataset": "rahim3/qwen38-tpu-env-v5e8",       # XLA cache + cloudflared + manifest
     "hf_model_id": "Qwen/Qwen3.8-27B",                # fallback download source
+    "hf_token": "",                # needed only for gated repos; also read from the
+                                   # HF_TOKEN env var / Kaggle secret if left empty
     "max_model_len": 262144,       # native context; drop to 131072 + max_num_seqs 16 for throughput
     "max_num_seqs": 4,
     "mtp_tokens": 3,               # MTP spec decoding (+34% in our A/B test). Stock vllm-tpu
@@ -161,6 +163,29 @@ def find_input(*patterns):
         if hits:
             return hits[0]
     return None
+
+
+def hf_token():
+    """Gated repos need a token: from the launcher config, the environment, or a
+    Kaggle secret named HF_TOKEN (attach it in the notebook's Add-ons menu)."""
+    if CFG["hf_token"]:
+        return CFG["hf_token"]
+    if os.environ.get("HF_TOKEN"):
+        return os.environ["HF_TOKEN"]
+    try:
+        from kaggle_secrets import UserSecretsClient
+        return UserSecretsClient().get_secret("HF_TOKEN")
+    except Exception:
+        return ""
+
+
+def chat_template(path):
+    """Qwen base keeps the template in tokenizer_config.json; checkpoints saved by
+    transformers v5 keep it in chat_template.jinja instead."""
+    tc = json.loads(Path(path, "tokenizer_config.json").read_text())
+    if tc.get("chat_template"):
+        return tc["chat_template"]
+    return Path(path, "chat_template.jinja").read_text()
 
 
 def fetch_cloudflared():
@@ -313,8 +338,8 @@ else:
             note="attach the weights dataset to skip this (~5 min parallel download)")
     t = time.time()
     from huggingface_hub import snapshot_download
-    model_path = snapshot_download(CFG["hf_model_id"], allow_patterns=[
-        "*.safetensors", "*.json", "*.txt", "tokenizer*", "vocab*", "merges*"])
+    model_path = snapshot_download(CFG["hf_model_id"], token=hf_token() or None, allow_patterns=[
+        "*.safetensors", "*.json", "*.txt", "*.jinja", "tokenizer*", "vocab*", "merges*"])
     publish("weights-downloaded", secs=int(time.time() - t))
 
 
@@ -348,8 +373,7 @@ def server_args(cfg):
     if cfg["reasoning_effort_default"] != "xhigh":
         # The chat template defaults reasoning_effort to 'xhigh'; ship a copy with a
         # different default so the server-side default changes without client changes.
-        tc = json.loads(Path(model_path, "tokenizer_config.json").read_text())
-        template = tc["chat_template"].replace(
+        template = chat_template(model_path).replace(
             "reasoning_effort|default('xhigh')",
             f"reasoning_effort|default('{cfg['reasoning_effort_default']}')")
         Path("/tmp/chat_template.jinja").write_text(template)

@@ -58,6 +58,10 @@ cd kaggle-tpu-lab
 python launch.py serve
 ```
 
+Or use the wrapper, which picks the model for you — `./quickstart.sh` on Linux/macOS,
+`.\quickstart.ps1` on Windows (`base`, `serenity` or `uncensored`; see the finetune
+section below). Extra arguments pass straight through to `launch.py serve`.
+
 That's it. The launcher pushes a script kernel to your Kaggle account, and streams
 progress to your terminal so you always know what's happening:
 
@@ -96,6 +100,59 @@ python launch.py serve --text-only                               # skip the visi
 python launch.py serve --fast-start                              # live in ~6 min; common shapes warmed after, rare ones stall ~1 min once
 ```
 
+## Serving a finetune instead of the base model
+
+Any Qwen3.8-27B finetune whose `config.json` still matches the base model's works here —
+same shapes means the pre-built XLA cache, the MTP head and the tool/reasoning parsers all
+keep working. Two that we checked file by file (`config.json`,
+`model.safetensors.index.json`, `chat_template.jinja` and `generation_config.json` are
+byte-identical to `Qwen/Qwen3.8-27B` in both):
+
+```bash
+./quickstart.sh serenity      # ReadyArt/Serenity-27B
+./quickstart.sh uncensored    # orcarouter/Qwen3.8-27B-Uncensored (gated: export HF_TOKEN first)
+```
+
+The wrapper just fills in three flags, so you can also drive `launch.py` directly:
+
+```bash
+# weights downloaded from HF inside the kernel (no dataset to prepare, ~10 min slower)
+python launch.py serve --weights-dataset "" \
+    --hf-model ReadyArt/Serenity-27B --served-model-name serenity-27b
+
+# gated repo: pass a read-only HF token (it gets embedded in the private kernel's source)
+python launch.py serve --weights-dataset "" \
+    --hf-model orcarouter/Qwen3.8-27B-Uncensored \
+    --served-model-name qwen3.8-27b-uncensored --hf-token hf_...
+```
+
+`quickstart.sh serenity` points at a private Kaggle mirror of the weights; set
+`WEIGHTS_DATASET` to your own, or to `""` to download from Hugging Face instead.
+
+Launching the same model repeatedly is much faster from a Kaggle dataset mirroring its
+weights — download the repo, then `kaggle datasets create` from that folder and pass it as
+`--weights-dataset <you>/<slug>`. Mind the quota: **100 GB across all your private
+datasets**, and each of these checkpoints is 55.6 GB, so two of them don't both fit.
+
+In the notebook flow the same two knobs are `hf_model_id` / `served_model_name` in the
+`serve_config.json` cell; a gated repo needs an `HF_TOKEN` secret (Add-ons → Secrets).
+
+Check a candidate before you spend a TPU session on it:
+
+```bash
+python - <<'EOF'
+import json, urllib.request
+def get(repo, f):
+    return urllib.request.urlopen(f"https://huggingface.co/{repo}/resolve/main/{f}").read()
+for f in ("config.json", "model.safetensors.index.json"):
+    same = get("Qwen/Qwen3.8-27B", f) == get("YOUR/FINETUNE", f)
+    print(f, "matches base:", same)
+EOF
+```
+
+A differing `config.json` means the graphs recompile cold (or the model doesn't load at
+all); a differing index means the MTP head may be missing, in which case launch with
+`--mtp 0`.
 
 ## Using it with coding agents
 
@@ -142,6 +199,7 @@ or turn thinking off entirely with `{"enable_thinking": false}`. To change the
 
 ```
 launch.py                        the CLI: serve / status / stop, with live progress
+quickstart.sh / quickstart.ps1   one-liner wrappers around `launch.py serve`
 kernel/serve_qwen38.py           the Kaggle kernel: runtime → cache → weights → vLLM → tunnel → READY
 notebook/qwen38-tpu-serve.ipynb  the same flow as a run-it-yourself notebook
 patches/mtp-rollback-v0280.diff  GDN state-rollback fix (port of tpu-inference PR #3178)

@@ -28,6 +28,7 @@ KERNEL_SRC = HERE / "kernel" / "serve_qwen38.py"
 STATE_FILE = Path.home() / ".kaggle-tpu-lab.json"
 
 WEIGHTS_DATASET = "rahim3/qwen3-8-27b-bf16"
+HF_MODEL = "Qwen/Qwen3.8-27B"
 ENV_DATASET = "rahim3/qwen38-tpu-env-v5e8"   # XLA compile cache + cloudflared + manifest
 
 # Friendly one-liners for each phase the kernel publishes.
@@ -99,6 +100,9 @@ def cmd_serve(args):
         "reasoning_effort_default": args.reasoning_effort,
         "keepalive_min": args.keepalive_min,
         "weights_dataset": args.weights_dataset,
+        "hf_model_id": args.hf_model,
+        "served_model_name": args.served_model_name,
+        "hf_token": args.hf_token,
     }
     if args.no_tools:
         cfg["tool_call_parser"] = ""
@@ -128,7 +132,7 @@ def cmd_serve(args):
             "enable_gpu": "false",
             "enable_tpu": "true",
             "enable_internet": "true",
-            "dataset_sources": [args.weights_dataset, ENV_DATASET],
+            "dataset_sources": [d for d in (args.weights_dataset, ENV_DATASET) if d],
             "competition_sources": [], "kernel_sources": [], "model_sources": [],
         }, indent=1))
         say(f"Pushing kernel {user}/{slug} (TPU v5e-8)...")
@@ -197,14 +201,14 @@ def render_event(ev):
         print(f"  API key  : {ev['api_key']}")
         print(f"  model    : {ev['model']}   (context: {ev.get('max_model_len', '?')})")
         print("=" * 66)
-        print("""
+        print(f"""
 Try it:
   curl $BASE/chat/completions -H "Authorization: Bearer $KEY" \\
-    -H "Content-Type: application/json" -d '{
-      "model": "qwen3.8-27b",
-      "messages": [{"role": "user", "content": "Hello!"}],
-      "chat_template_kwargs": {"reasoning_effort": "low"}
-    }'
+    -H "Content-Type: application/json" -d '{{
+      "model": "{ev['model']}",
+      "messages": [{{"role": "user", "content": "Hello!"}}],
+      "chat_template_kwargs": {{"reasoning_effort": "low"}}
+    }}'
 
 See the README for hooking this into Claude Code, Codex CLI, opencode, etc.
 """)
@@ -340,7 +344,19 @@ def main():
                    help="server-side default; clients can still override per request")
     s.add_argument("--keepalive-min", type=int, default=480,
                    help="auto-shutdown after this many minutes of serving")
-    s.add_argument("--weights-dataset", default=WEIGHTS_DATASET)
+    s.add_argument("--weights-dataset", default=WEIGHTS_DATASET,
+                   help="Kaggle dataset mirroring the weights; pass '' to download "
+                        "them from Hugging Face inside the kernel instead")
+    s.add_argument("--hf-model", default=HF_MODEL,
+                   help="Hugging Face repo the weights come from — the download source "
+                        "when no weights dataset is attached. Any Qwen3.8-27B finetune "
+                        "works: its config.json must match the base model's, or the "
+                        "prebuilt XLA cache stops matching")
+    s.add_argument("--served-model-name", default="qwen3.8-27b",
+                   help="model name clients send in requests")
+    s.add_argument("--hf-token", default="",
+                   help="Hugging Face token, for gated repos. The kernel is private, "
+                        "but the token is embedded in its source — prefer a read-only one")
     s.add_argument("--no-tools", action="store_true",
                    help="disable tool-calling support")
     s.add_argument("--text-only", action="store_true",
