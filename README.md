@@ -2,6 +2,8 @@
 
 > **Public reviewed fork.** The runnable Kaggle notebook is
 > [keithvo/qwen3-8-27b-bf16-on-kaggle-tpu-130-tok-s-api](https://www.kaggle.com/code/keithvo/qwen3-8-27b-bf16-on-kaggle-tpu-130-tok-s-api).
+> Open that page, click **Copy & Edit**, and follow the numbered beginner guide;
+> the public view itself is read-only.
 > Runtime code is based on the MIT-licensed
 > [ARahim3/kaggle-tpu-lab](https://github.com/ARahim3/kaggle-tpu-lab). See the
 > [input audit](docs/INPUT_AUDIT.md) for the three-notebook comparison and the
@@ -41,7 +43,8 @@ and a tunnel to the outside world.
 
 ## Quick start A — as a Kaggle notebook
 
-**Copy & Edit** this fork's public Kaggle notebook and Run it —
+Open this fork's public Kaggle notebook, click **Copy & Edit**, and follow its
+numbered hardware, input, configuration, launch, and API-test steps —
 [**kaggle.com/code/keithvo/qwen3-8-27b-bf16-on-kaggle-tpu-130-tok-s-api**](https://www.kaggle.com/code/keithvo/qwen3-8-27b-bf16-on-kaggle-tpu-130-tok-s-api)
 — or upload [`notebook/qwen38-tpu-serve.ipynb`](notebook/qwen38-tpu-serve.ipynb) yourself.
 Set **Accelerator = TPU VM v5e-8**, **Internet = ON**, attach the two datasets named in
