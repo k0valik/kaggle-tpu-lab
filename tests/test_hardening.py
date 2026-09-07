@@ -146,6 +146,12 @@ class DownloadTests(unittest.TestCase):
 
 
 class StateAndIntegrationTests(unittest.TestCase):
+    def test_kaggle_uses_environment_console_script(self):
+        with mock.patch.object(launch.shutil, 'which', return_value='/venv/bin/kaggle'), \
+             mock.patch.object(launch.subprocess, 'run', return_value=mock.Mock()) as run:
+            launch.kaggle('kernels', 'list')
+        self.assertEqual(run.call_args.args[0], ['/venv/bin/kaggle', 'kernels', 'list'])
+
     def test_state_permissions_under_permissive_umask_and_symlink(self):
         with tempfile.TemporaryDirectory() as directory:
             target = Path(directory) / 'other-file'

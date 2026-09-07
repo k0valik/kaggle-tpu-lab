@@ -55,7 +55,11 @@ PHASE_TEXT = {
 
 
 def kaggle(*args, capture=True):
-    cmd = [sys.executable, "-m", "kaggle", *args]
+    executable = shutil.which("kaggle", path=str(Path(sys.executable).parent))
+    if not executable:
+        sys.exit("Kaggle CLI is not installed for this Python environment.\n"
+                 "Install it with `python -m pip install kaggle`.")
+    cmd = [executable, *args]
     r = subprocess.run(cmd, capture_output=capture, text=True)
     return r
 
@@ -320,8 +324,11 @@ def cmd_status(args):
 def cmd_stop(args):
     st = load_state()
     say(f"Deleting kernel {st['kernel']} (terminates the TPU session)...")
-    p = subprocess.run([sys.executable, "-m", "kaggle", "kernels", "delete",
-                        st["kernel"]], input="yes\n", capture_output=True, text=True)
+    executable = shutil.which("kaggle", path=str(Path(sys.executable).parent))
+    if not executable:
+        sys.exit("Kaggle CLI is not installed for this Python environment.")
+    p = subprocess.run([executable, "kernels", "delete", st["kernel"]],
+                       input="yes\n", capture_output=True, text=True)
     say((p.stdout + p.stderr).strip() or "done")
 
 
