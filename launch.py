@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-kaggle-tpu-lab launcher — serve Qwen3.8-27B on a free Kaggle TPU from your terminal.
+kaggle-tpu-lab launcher — serve Huihui-Qwen3.8-27B-Abliterated (Uncensored) on a free Kaggle TPU.
 
     python launch.py serve                 # push the kernel and watch it come up
     python launch.py serve --reasoning-effort medium --mtp 3
@@ -27,7 +27,8 @@ HERE = Path(__file__).resolve().parent
 KERNEL_SRC = HERE / "kernel" / "serve_qwen38.py"
 STATE_FILE = Path.home() / ".kaggle-tpu-lab.json"
 
-WEIGHTS_DATASET = "rahim3/qwen3-8-27b-bf16"
+WEIGHTS_DATASET = "xiaotian1171/huihui-qwen38-27b-abliterated"
+HF_MODEL_ID = "huihui-ai/Huihui-Qwen3.8-27B-abliterated"
 ENV_DATASET = "rahim3/qwen38-tpu-env-v5e8"   # XLA compile cache + cloudflared + manifest
 
 # Friendly one-liners for each phase the kernel publishes.
@@ -99,6 +100,7 @@ def cmd_serve(args):
         "reasoning_effort_default": args.reasoning_effort,
         "keepalive_min": args.keepalive_min,
         "weights_dataset": args.weights_dataset,
+        "hf_model_id": args.hf_model_id,
     }
     if args.no_tools:
         cfg["tool_call_parser"] = ""
@@ -257,6 +259,51 @@ def watch(kernel, topic):
             "re-attach, `python launch.py stop` to kill it.")
 
 
+def cmd_build_weights(args):
+    """Push a free Kaggle CPU kernel that downloads Huihui-Qwen3.8-27B-abliterated
+    from Hugging Face and prepares it for Kaggle Dataset creation."""
+    check_auth()
+    user = kaggle_username(args.user)
+    slug = args.slug
+    say(f"Preparing weights downloader kernel for {args.hf_model_id}...")
+    downloader_code = f"""import os
+import time
+from pathlib import Path
+from huggingface_hub import snapshot_download
+
+print("=== Step 1/2: Downloading weights from Hugging Face ===")
+print("Repository: {args.hf_model_id}")
+out_dir = Path("/kaggle/working/weights")
+out_dir.mkdir(parents=True, exist_ok=True)
+
+t0 = time.time()
+snapshot_download(
+    repo_id="{args.hf_model_id}",
+    local_dir=str(out_dir),
+    allow_patterns=["*.safetensors", "*.json", "*.txt", "tokenizer*", "vocab*", "merges*"]
+)
+print(f"=== Step 2/2: Download complete in {int(time.time() - t0)}s ===")
+print("Weights ready in /kaggle/working/weights. You can now create a Kaggle dataset from this kernel output.")
+"""
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        (td / "download.py").write_text(downloader_code)
+        (td / "kernel-metadata.json").write_text(json.dumps({
+            "id": f"{user}/{slug}", "title": slug, "code_file": "download.py",
+            "language": "python", "kernel_type": "script", "is_private": "true",
+            "enable_gpu": "false", "enable_tpu": "false", "enable_internet": "true",
+            "dataset_sources": [], "competition_sources": [], "kernel_sources": [], "model_sources": [],
+        }, indent=1))
+        say(f"Pushing free CPU kernel {user}/{slug}...")
+        r = kaggle("kernels", "push", "-p", str(td))
+        out = (r.stdout or "") + (r.stderr or "")
+        if "successfully pushed" not in out:
+            sys.exit(f"Push failed:\n{out.strip()}")
+        say(f"Successfully pushed {user}/{slug} (CPU unmetered).")
+        say(f"Track kernel progress at: https://www.kaggle.com/code/{user}/{slug}")
+        say("Once complete, export as Kaggle Dataset: xiaotian1171/huihui-qwen38-27b-abliterated")
+
+
 def cmd_build_env(args):
     """Maintainer flow. When the kernel finishes:
         kaggle kernels output <user>/<slug> -p bundle_out
@@ -341,6 +388,8 @@ def main():
     s.add_argument("--keepalive-min", type=int, default=480,
                    help="auto-shutdown after this many minutes of serving")
     s.add_argument("--weights-dataset", default=WEIGHTS_DATASET)
+    s.add_argument("--hf-model-id", default=HF_MODEL_ID,
+                   help="fallback Hugging Face repo if dataset is not attached")
     s.add_argument("--no-tools", action="store_true",
                    help="disable tool-calling support")
     s.add_argument("--text-only", action="store_true",
@@ -354,11 +403,20 @@ def main():
                         "unusual request shape stalls ~1 min the first time")
     s.set_defaults(fn=cmd_serve)
 
+    s = sub.add_parser("build-weights", help="push a free CPU kernel to download "
+                       "Huihui-Qwen3.8-27B-abliterated weights for dataset creation")
+    s.add_argument("--user", help="Kaggle username (auto-detected if possible)")
+    s.add_argument("--slug", default="build-qwen38-abliterated-weights")
+    s.add_argument("--hf-model-id", default=HF_MODEL_ID)
+    s.set_defaults(fn=cmd_build_weights)
+
     s = sub.add_parser("build-env", help="(maintainers) push a kernel that builds the "
                        "env dataset: venv + XLA cache + cloudflared")
     s.add_argument("--user", help="Kaggle username (auto-detected if possible)")
     s.add_argument("--slug", default="qwen38-env-bundle")
     s.add_argument("--weights-dataset", default=WEIGHTS_DATASET)
+    s.add_argument("--hf-model-id", default=HF_MODEL_ID,
+                   help="fallback Hugging Face repo if dataset is not attached")
     s.set_defaults(fn=cmd_build_env)
 
     s = sub.add_parser("status", help="show current kernel status + recent events")

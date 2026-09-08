@@ -1,6 +1,6 @@
-# kaggle-tpu-lab
+# kaggle-tpu-lab (Uncensored / Abliterated Edition)
 
-**Serve Qwen3.8-27B — a frontier-class 27B hybrid-attention model — on Kaggle's free
+**Serve Huihui-Qwen3.8-27B-Abliterated — an uncensored frontier-class 27B hybrid-attention model — a frontier-class 27B hybrid-attention model — on Kaggle's free
 TPU v5e-8, with a public OpenAI-compatible endpoint you can plug into Claude Code,
 Codex CLI, opencode, or anything else that speaks the OpenAI API.**
 
@@ -21,6 +21,9 @@ Tuning note: speculative decoding pays off up to ~8 concurrent streams and fades
 that (verification competes with batch compute). Serving many users? Launch with
 `--max-model-len 131072 --max-num-seqs 16 --mtp 0` for max aggregate throughput.
 
+
+> **Uncensored / Abliterated Edition**: This fork is tailored for [`huihui-ai/Huihui-Qwen3.8-27B-abliterated`](https://huggingface.co/huihui-ai/Huihui-Qwen3.8-27B-abliterated). Because representation abliteration operates via weight-orthogonal projection without modifying tensor shapes or layer structures, **the pre-compiled JAX/XLA graph cache (`rahim3/qwen38-tpu-env-v5e8`) is 100% compatible and reused**. You get native 130 tok/s and 262k context without any safety refusals!
+
 ## Why this works (the one-paragraph version)
 
 Qwen3.8-27B is a hybrid: 48 of its 64 layers are **gated-DeltaNet linear attention**, only
@@ -31,6 +34,17 @@ stack could run the DeltaNet layers — [vllm-tpu](https://github.com/vllm-proje
 puts it all together on Kaggle's free tier: a pre-built Python runtime with pinned
 versions, pre-mirrored weights, a pre-built XLA compile cache, MTP speculative decoding,
 and a tunnel to the outside world.
+
+### Step 0: Prepare Weights Dataset (Free CPU, One-time)
+
+To avoid spending 15-20 minutes of your weekly 20h TPU quota on downloading 55 GB weights every run:
+1. Run the weights downloader on Kaggle's **free & unmetered CPU**:
+   ```bash
+   python launch.py build-weights
+   ```
+   Or run [`notebook/build_weights_dataset.ipynb`](notebook/build_weights_dataset.ipynb) in the Kaggle UI.
+2. Once complete, save the output as your private Kaggle dataset (`xiaotian1171/huihui-qwen38-27b-abliterated`).
+3. If you skip this, `launch.py serve` will automatically fallback to downloading directly from Hugging Face on the TPU.
 
 ## Quick start A — as a Kaggle notebook
 

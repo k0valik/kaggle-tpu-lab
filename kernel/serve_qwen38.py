@@ -42,9 +42,9 @@ CFG = None  # __LAUNCHER_CONFIG__  (launch.py replaces this line)
 
 DEFAULTS = {
     "vllm_tpu_version": "0.28.0",
-    "weights_dataset": "rahim3/qwen3-8-27b-bf16",     # HF mirror of Qwen/Qwen3.8-27B
+    "weights_dataset": "xiaotian1171/huihui-qwen38-27b-abliterated", # HF mirror of Huihui-Qwen3.8-27B-abliterated
     "env_dataset": "rahim3/qwen38-tpu-env-v5e8",       # XLA cache + cloudflared + manifest
-    "hf_model_id": "Qwen/Qwen3.8-27B",                # fallback download source
+    "hf_model_id": "huihui-ai/Huihui-Qwen3.8-27B-abliterated", # fallback download source
     "max_model_len": 262144,       # native context; drop to 131072 + max_num_seqs 16 for throughput
     "max_num_seqs": 4,
     "mtp_tokens": 3,               # MTP spec decoding (+34% in our A/B test). Stock vllm-tpu
@@ -305,7 +305,7 @@ else:
 # ---------------- 3. weights ----------------
 banner(3, "Model weights", "55 GB bf16 safetensors")
 weights_slug = CFG["weights_dataset"].split("/")[-1]
-model_path = find_input(weights_slug)
+model_path = find_input(weights_slug, "*huihui*", "*abliterated*", "*qwen3*27b*")
 if model_path and os.path.exists(os.path.join(model_path, "config.json")):
     publish("weights-mounted", path=model_path)
 else:
