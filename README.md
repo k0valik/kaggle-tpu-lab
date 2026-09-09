@@ -41,6 +41,11 @@ Set **Accelerator = TPU VM v5e-8**, **Internet = ON**, attach the two datasets n
 the first cell, and run top to bottom. The last cell *is* the server — the endpoint URL
 and API key appear in its output.
 
+For another compatible Qwen3.8 checkpoint, use the sanitized
+[`notebook/qwen38-tpu-serve-uncensored.ipynb`](notebook/qwen38-tpu-serve-uncensored.ipynb)
+example. It downloads the configured Hugging Face model unless you set
+`weights_dataset` to your own Kaggle weights dataset.
+
 ## Quick start B — from your terminal
 
 You need Python 3.9+ and a Kaggle account with **TPU access** (Settings → phone-verify
@@ -91,10 +96,46 @@ sequences):
 ```bash
 python launch.py serve --max-model-len 131072 --max-num-seqs 16  # many parallel streams (~900 tok/s aggregate)
 python launch.py serve --reasoning-effort medium                 # server-side default
-python launch.py serve --keepalive-min 120                       # auto-stop after 2 h
+python launch.py serve --keepalive-min 180                       # auto-stop after 3 h (the default)
 python launch.py serve --text-only                               # skip the vision tower: ~10 min faster, no image inputs
 python launch.py serve --fast-start                              # live in ~6 min; common shapes warmed after, rare ones stall ~1 min once
 ```
+
+For a fixed Cloudflare hostname, create a remotely-managed tunnel whose published
+application points to `http://localhost:8000`. Store its token in a Kaggle Secret named
+`CF_TUNNEL_TOKEN`, then launch with:
+
+```bash
+python launch.py serve --cloudflare-hostname qwen.example.com
+```
+
+The token is read only inside Kaggle and passed to `cloudflared` through its environment,
+so it is not written to the kernel source or command line. The launcher monitors the
+connector and restarts it after a disconnect; the public hostname stays unchanged.
+For a stable API key too, add it as the Kaggle Secret `KTL_API_KEY` and pass
+`--api-key-secret KTL_API_KEY`.
+
+To serve a compatible custom Qwen3.8 checkpoint directly from Hugging Face while
+keeping only the reusable TPU environment/cache dataset attached:
+
+```bash
+python launch.py serve \
+  --hf-model-id JonathanColetti/Qwen3.8-27B-Uncensored \
+  --served-model-name qwen3.8-27b-uncensored \
+  --weights-dataset none \
+  --fast-start --keepalive-min 180
+```
+
+The first run downloads the custom weights into the session's temporary disk. A new
+non-persistent Kaggle session downloads them again unless you create and attach your
+own weights dataset. Once uploaded, replace `none` with its Kaggle slug, for example
+`--weights-dataset YOUR_USERNAME/qwen38-27b-uncensored-bf16`. The original
+`rahim3/qwen3-8-27b-bf16` dataset contains the official checkpoint and should not be
+attached for a different model. The `rahim3/qwen38-tpu-env-v5e8` environment/cache
+dataset remains attached because compatible checkpoints with the same architecture and
+tensor shapes can reuse its compiled graphs. Direct downloads use plain HTTP by default
+because hf-xet can stall on Kaggle after an initial high-speed burst; `--use-xet` opts
+back into it.
 
 
 ## Using it with coding agents
@@ -144,8 +185,10 @@ or turn thinking off entirely with `{"enable_thinking": false}`. To change the
 launch.py                        the CLI: serve / status / stop, with live progress
 kernel/serve_qwen38.py           the Kaggle kernel: runtime → cache → weights → vLLM → tunnel → READY
 notebook/qwen38-tpu-serve.ipynb  the same flow as a run-it-yourself notebook
+notebook/qwen38-tpu-serve-uncensored.ipynb  custom-checkpoint notebook example
 patches/mtp-rollback-v0280.diff  GDN state-rollback fix (port of tpu-inference PR #3178)
 tools/embed_patch.py             re-embeds the patch into the kernel script after edits
+tools/sync_notebooks.py          refreshes embedded kernel code and clears notebook output
 ```
 
 Plus two public Kaggle datasets the kernel attaches:
@@ -182,8 +225,9 @@ folder in the Kaggle UI (Output tab → New Dataset).
 - **One TPU session at a time** per Kaggle account, sessions cap at 9 h, free quota is
   ~20 TPU-hours/week. The server auto-stops after `--keepalive-min` so a forgotten
   session doesn't eat your quota.
-- **The endpoint is public** (random cloudflared URL) but protected by the generated
-  API key. Treat the URL+key pair like a secret; a new launch gets fresh ones.
+- **The endpoint is public** and protected by the generated API key. Without
+  `--cloudflare-hostname` it uses a random temporary URL. Treat the URL+key pair like a
+  secret; a new launch gets a fresh API key.
 - **Prefix caching is off for now**: vllm-tpu 0.28.0 deliberately disables automatic
   prefix caching for hybrid linear-attention models on TPU. Upstream merged the fix
   two days after the 0.28.0 release, so a near-future version bump should enable it.
@@ -199,7 +243,7 @@ folder in the Kaggle UI (Output tab → New Dataset).
   ~1 min and may even time out at the tunnel (HTTP 524) — just retry; every later image
   of that size is instant. Coding agents send screenshots at a consistent size, so this
   is paid once. `--text-only` drops image support and ~8 min of startup.
-- **MTP speculative decoding: on by default, and there's a story.** Qwen3.8 ships a
+- **MTP speculative decoding is off by default for stability.** Qwen3.8 ships a
   native MTP draft head, but stock vllm-tpu 0.28.0 **corrupts outputs** with it on
   TPU — rejected draft tokens advance the gated-DeltaNet recurrent state and are never
   rolled back (0/12 greedy prompts matched in our verification, with visible garbage).
@@ -209,9 +253,12 @@ folder in the Kaggle UI (Output tab → New Dataset).
   ([`patches/mtp-rollback-v0280.diff`](patches/mtp-rollback-v0280.diff)), applied to
   the installed wheel before serving. With the patch: **12/12 greedy prompts match the
   non-speculative outputs exactly**, at +34 % decode speed in the A/B test (104 vs 78 tok/s at the time; the shipped config now measures ~130; healthy
-  acceptance profile of 87/66/52 % per draft position). If the patch ever fails to
+  acceptance profile of 87/66/52 % per draft position). A later long-running Hermes
+  request nevertheless exposed a vllm-tpu scheduler crash (`AttributeError` while
+  trimming draft tokens), so production-style launches now default to `--mtp 0`. If the patch ever fails to
   apply (e.g. a future vllm-tpu version), the script disables MTP automatically rather
-  than serve corrupted outputs. `--mtp 0` turns it off; k=4 fails to start.
+  than serve corrupted outputs. `--mtp 3` opts back into the faster but experimental
+  path; k=4 fails to start.
 - **Harmless log noise.** vLLM prints a few scary-looking lines on every TPU start:
   `Unable to poll the TPU GCE Metadata` (Kaggle isn't a GCE VM), `Failed to import
   from vllm._C` (that's the CUDA extension), `Triton ... 0 active driver(s)`, and

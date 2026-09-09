@@ -21,6 +21,7 @@ text_only, ~6 with fast_start). Without the env dataset the compile is cold (+15
 """
 import base64
 import collections
+import fnmatch
 import struct
 import zlib
 import glob
@@ -47,11 +48,8 @@ DEFAULTS = {
     "hf_model_id": "Qwen/Qwen3.8-27B",                # fallback download source
     "max_model_len": 262144,       # native context; drop to 131072 + max_num_seqs 16 for throughput
     "max_num_seqs": 4,
-    "mtp_tokens": 3,               # MTP spec decoding (+34% in our A/B test). Stock vllm-tpu
-                                   # 0.28.0 corrupts outputs with it (missing GDN state
-                                   # rollback); we apply patches/mtp-rollback-v0280.diff
-                                   # (a port of upstream PR #3178) before serving —
-                                   # verified lossless, 12/12 greedy exact-match.
+    "mtp_tokens": 0,               # stability default. vllm-tpu 0.28.0 MTP can still crash
+                                   # on some long or streaming request shapes.
     "reasoning_effort_default": "xhigh",   # server-side default: xhigh | medium | low
     "tool_call_parser": "qwen3_coder",  # matches Qwen3.8's XML tool format; "" disables
     "text_only": False,            # True: skip the vision tower + its TPU graphs (saves ~8 min,
@@ -61,10 +59,14 @@ DEFAULTS = {
     "fast_start": False,           # True: skip precompile -> READY in ~4 min (needs the env
                                    # dataset's cache); the script then warms the common
                                    # request shapes itself; rare shapes stall once (~1 min)
-    "keepalive_min": 480,          # auto-shutdown guard (Kaggle TPU caps at 9h anyway)
-    "api_key": "",                 # generated if empty
+    "keepalive_min": 180,          # auto-shutdown guard; protects the weekly TPU quota
+    "api_key": "",                 # generated if empty and no secret is configured
+    "api_key_secret": "KTL_API_KEY",  # optional stable key stored in Kaggle Secrets
     "ntfy_topic": "",              # optional: publish progress to ntfy.sh/<topic>
     "served_model_name": "qwen3.8-27b",
+    "cloudflare_hostname": "",     # named tunnel hostname, e.g. llm.example.com
+    "cloudflare_token_secret": "CF_TUNNEL_TOKEN",  # Kaggle Secret label (never the token)
+    "hf_disable_xet": True,       # plain HTTP is slower but avoids observed hf-xet stalls on Kaggle
     "verbose": False,              # show every vLLM log line (always saved to vllm.log)
     "build_bundle": False,         # maintainer mode: build the env dataset instead of serving
 }
@@ -73,6 +75,12 @@ CFG = {**DEFAULTS, **(CFG or {})}
 _cfg_file = Path("serve_config.json")
 if _cfg_file.exists():
     CFG.update(json.loads(_cfg_file.read_text()))
+if not CFG["api_key"] and CFG.get("api_key_secret"):
+    try:
+        from kaggle_secrets import UserSecretsClient
+        CFG["api_key"] = UserSecretsClient().get_secret(CFG["api_key_secret"]) or ""
+    except Exception:
+        pass
 if not CFG["api_key"]:
     CFG["api_key"] = "sk-" + secrets.token_hex(16)
 
@@ -87,7 +95,12 @@ T0 = time.time()
 PY_VER = f"{sys.version_info.major}.{sys.version_info.minor}"
 
 os.environ["HF_HOME"] = "/tmp/hf"                 # /kaggle/working is only ~21 GB
-os.environ["HF_XET_HIGH_PERFORMANCE"] = "1"
+if CFG["hf_disable_xet"]:
+    os.environ["HF_HUB_DISABLE_XET"] = "1"
+    os.environ.pop("HF_XET_HIGH_PERFORMANCE", None)
+else:
+    os.environ["HF_XET_HIGH_PERFORMANCE"] = "1"
+os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "60")
 os.environ["VLLM_XLA_CACHE_PATH"] = XLA_CACHE
 os.environ["MIN_TOKEN_BUCKET"] = str(CFG["min_token_bucket"])
 os.environ["NUM_PRECOMPILE_WORKERS"] = str(CFG["precompile_workers"])
@@ -122,8 +135,11 @@ def publish(phase, **extra):
     if not CFG["ntfy_topic"]:
         return
     try:
+        # A progress topic is transport, not secret storage. Keep the API key in
+        # the notebook output and the launcher's chmod-0600 local state file only.
+        remote_extra = {k: v for k, v in extra.items() if k != "api_key"}
         body = {"topic": CFG["ntfy_topic"], "title": f"kaggle-tpu-lab {phase}",
-                "message": json.dumps({"phase": phase, **extra})}
+                "message": json.dumps({"phase": phase, **remote_extra})}
         req = urllib.request.Request("https://ntfy.sh", data=json.dumps(body).encode(),
                                      headers={"Content-Type": "application/json"})
         urllib.request.urlopen(req, timeout=10)
@@ -163,6 +179,44 @@ def find_input(*patterns):
     return None
 
 
+WEIGHT_PATTERNS = (
+    "*.safetensors", "*.json", "*.txt", "*.jinja", "tokenizer*", "vocab*", "merges*"
+)
+
+
+def cache_usage():
+    """Best-effort HF cache size for progress reporting, including partial files."""
+    root = Path(os.environ["HF_HOME"])
+    total = 0
+    files = 0
+    if root.exists():
+        for path in root.rglob("*"):
+            try:
+                if path.is_file() and not path.name.endswith(".lock"):
+                    total += path.stat().st_size
+                    files += 1
+            except OSError:
+                pass
+    return total, files
+
+
+def validate_model_snapshot(model_path):
+    """Fail early when a snapshot is incomplete instead of letting vLLM fail obscurely."""
+    root = Path(model_path)
+    required = ["config.json", "tokenizer_config.json", "model.safetensors.index.json"]
+    missing = [name for name in required if not (root / name).is_file()]
+    index_path = root / "model.safetensors.index.json"
+    if index_path.is_file():
+        try:
+            index = json.loads(index_path.read_text())
+            missing.extend(sorted({name for name in index.get("weight_map", {}).values()
+                                   if not (root / name).is_file()}))
+        except (OSError, ValueError) as e:
+            raise RuntimeError(f"invalid model weight index: {e}") from e
+    if missing:
+        raise RuntimeError("model snapshot is incomplete; missing: " + ", ".join(missing[:12]))
+
+
 def fetch_cloudflared():
     if CLOUDFLARED.exists():
         return
@@ -173,6 +227,18 @@ def fetch_cloudflared():
         CLOUDFLARED.chmod(0o755)
     except Exception as e:
         log(f"(cloudflared download failed: {e})")
+
+
+def kaggle_secret(label):
+    """Read a Kaggle Secret without ever copying its value into config or logs."""
+    if not label:
+        return ""
+    try:
+        from kaggle_secrets import UserSecretsClient
+        return UserSecretsClient().get_secret(label) or ""
+    except Exception as e:
+        log(f"   could not read Kaggle Secret {label!r}: {type(e).__name__}")
+        return ""
 
 
 # gzip+base64 of patches/mtp-rollback-v0280.diff; regenerated by tools/embed_patch.py
@@ -303,19 +369,61 @@ else:
     publish("cache-missing", note="cold compile: expect ~10 extra minutes")
 
 # ---------------- 3. weights ----------------
-banner(3, "Model weights", "55 GB bf16 safetensors")
-weights_slug = CFG["weights_dataset"].split("/")[-1]
-model_path = find_input(weights_slug)
+banner(3, "Model weights", "bf16 safetensors")
+weights_dataset = str(CFG.get("weights_dataset") or "").strip()
+weights_slug = weights_dataset.split("/")[-1] if weights_dataset else ""
+model_path = find_input(weights_slug) if weights_slug else None
 if model_path and os.path.exists(os.path.join(model_path, "config.json")):
     publish("weights-mounted", path=model_path)
 else:
     publish("weights-download", model=CFG["hf_model_id"],
-            note="attach the weights dataset to skip this (~5 min parallel download)")
+            note="downloads resume from /tmp/hf if the process is retried in this session")
     t = time.time()
-    from huggingface_hub import snapshot_download
-    model_path = snapshot_download(CFG["hf_model_id"], allow_patterns=[
-        "*.safetensors", "*.json", "*.txt", "tokenizer*", "vocab*", "merges*"])
-    publish("weights-downloaded", secs=int(time.time() - t))
+    stop_progress = threading.Event()
+
+    def report_download_progress():
+        while not stop_progress.wait(60):
+            cached, files = cache_usage()
+            free = shutil.disk_usage("/tmp").free
+            publish("weights-progress", elapsed_s=int(time.time() - t), files=files,
+                    downloaded_gb=round(cached / 1e9, 1), free_gb=round(free / 1e9, 1))
+
+    threading.Thread(target=report_download_progress, daemon=True).start()
+    try:
+        from huggingface_hub import HfApi, snapshot_download
+        token = os.environ.get("HF_TOKEN") or None
+        try:
+            info = HfApi().model_info(CFG["hf_model_id"], files_metadata=True, token=token)
+            wanted = [f for f in info.siblings
+                      if any(fnmatch.fnmatch(f.rfilename, p) for p in WEIGHT_PATTERNS)]
+            expected = sum((f.size or 0) for f in wanted)
+            free = shutil.disk_usage("/tmp").free
+            log(f"   snapshot contains {len(wanted)} selected files / {expected / 1e9:.1f} GB; "
+                f"{free / 1e9:.1f} GB free in /tmp")
+            if expected and free < expected:
+                log("   WARNING: free space is below the full snapshot size; a fresh download "
+                    "may run out of disk")
+        except Exception as e:
+            log(f"   metadata preflight unavailable ({e}); continuing with resumable download")
+        workers = 4 if CFG["hf_disable_xet"] else 8
+        log(f"   downloader: {'plain HTTP' if CFG['hf_disable_xet'] else 'hf-xet'}, "
+            f"{workers} file workers")
+        model_path = snapshot_download(CFG["hf_model_id"], token=token,
+                                       allow_patterns=list(WEIGHT_PATTERNS), max_workers=workers)
+        validate_model_snapshot(model_path)
+    except Exception as e:
+        cached, _ = cache_usage()
+        free = shutil.disk_usage("/tmp").free
+        publish("failed", step="weights", error=str(e)[-1200:],
+                downloaded_gb=round(cached / 1e9, 1), free_gb=round(free / 1e9, 1))
+        raise
+    finally:
+        stop_progress.set()
+    cached, files = cache_usage()
+    publish("weights-downloaded", secs=int(time.time() - t), files=files,
+            downloaded_gb=round(cached / 1e9, 1))
+
+validate_model_snapshot(model_path)
 
 
 # ---------------- 4. vLLM server ----------------
@@ -718,32 +826,92 @@ for _ in range(60):  # cloudflared download runs in the background from step 1
     if CLOUDFLARED.exists():
         break
     time.sleep(2)
-if CLOUDFLARED.exists():
-    tunnel = subprocess.Popen([str(CLOUDFLARED), "tunnel", "--url", f"http://127.0.0.1:{PORT}",
-                               "--no-autoupdate", "--protocol", "quic"],
-                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    pat = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com")
-    lines = []
+cf_hostname = CFG["cloudflare_hostname"].strip().lower().removeprefix("https://").rstrip("/")
+cf_token = kaggle_secret(CFG["cloudflare_token_secret"]) if cf_hostname else ""
+if cf_hostname and cf_token and CLOUDFLARED.exists():
+    # Keep the configured URL stable even while its connector is reconnecting.
+    url = f"https://{cf_hostname}"
+elif cf_hostname and not cf_token:
+    log(f"   fixed hostname disabled: Kaggle Secret "
+        f"{CFG['cloudflare_token_secret']!r} is unavailable")
+elif cf_hostname:
+    log("   fixed hostname disabled: cloudflared is unavailable")
+cf_lines = []
+cf_lock = threading.Lock()
 
-    def pump_cf():
-        for line in tunnel.stdout:
-            lines.append(line.rstrip())
+def start_tunnel():
+    """Start cloudflared. Named tunnels keep the same URL across reconnects."""
+    if cf_hostname:
+        if not cf_token:
+            return None
+        # UDP/QUIC is unreliable from Kaggle; named tunnels support HTTP/2.
+        cmd = [str(CLOUDFLARED), "tunnel", "--no-autoupdate",
+               "--protocol", "http2", "run"]
+        child_env = {**os.environ, "TUNNEL_TOKEN": cf_token}
+    else:
+        cmd = [str(CLOUDFLARED), "tunnel", "--url", f"http://127.0.0.1:{PORT}",
+               "--no-autoupdate", "--protocol", "quic"]
+        child_env = None
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True, env=child_env)
+
+    def pump_cf(p):
+        for line in p.stdout:
+            with cf_lock:
+                cf_lines.append(line.rstrip())
+                del cf_lines[:-500]
             _raw.write(f"[cloudflared] {line}")
-    threading.Thread(target=pump_cf, daemon=True).start()
-    deadline = time.time() + 180
-    while time.time() < deadline and url is None:
-        for ln in lines:
-            m = pat.search(ln)
-            if m:
-                url = m.group(0).rstrip("/")
-                break
-        time.sleep(1)
+    threading.Thread(target=pump_cf, args=(proc,), daemon=True).start()
+    return proc
+
+if CLOUDFLARED.exists():
+    tunnel = start_tunnel()
+    if cf_hostname and tunnel:
+        # The hostname-to-localhost route is stored in Cloudflare, not in this notebook.
+        time.sleep(3)
+        if tunnel.poll() is not None:
+            log("   named tunnel exited during startup; see cloudflared lines in vllm.log")
+    elif not cf_hostname:
+        pat = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com")
+        deadline = time.time() + 180
+        while time.time() < deadline and url is None:
+            with cf_lock:
+                snapshot = list(cf_lines)
+            for ln in snapshot:
+                m = pat.search(ln)
+                if m:
+                    url = m.group(0).rstrip("/")
+                    break
+            time.sleep(1)
 if url:
     log(f"   your endpoint will be  {url}/v1")
     log("   (not live yet — it answers 502 until the READY banner below)")
+    if cf_hostname:
+        log("   named tunnel enabled: fixed URL with automatic reconnect")
     publish("tunnel-url", endpoint=f"{url}/v1")
 else:
     publish("tunnel-failed", note="server still reachable inside the kernel on :8000")
+
+# A named tunnel can occasionally lose its connector while the TPU server is healthy.
+# Restart it in-place; the public hostname and Hermes configuration remain unchanged.
+if cf_hostname and tunnel:
+    def watch_tunnel():
+        global tunnel
+        failures = 0
+        while True:
+            time.sleep(10)
+            if tunnel.poll() is None:
+                failures = 0
+                continue
+            failures += 1
+            delay = min(60, 2 ** min(failures, 5))
+            publish("tunnel-reconnecting", endpoint=f"{url}/v1", retry_secs=delay)
+            log(f"   cloudflared disconnected; reconnecting fixed tunnel in {delay} s")
+            time.sleep(delay)
+            replacement = start_tunnel()
+            if replacement is not None:
+                tunnel = replacement
+    threading.Thread(target=watch_tunnel, daemon=True).start()
 
 # ---------------- 6. wait, announce, self-test, keep alive ----------------
 startup = wait_healthy(server, CFG, expect_min)

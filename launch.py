@@ -29,6 +29,8 @@ STATE_FILE = Path.home() / ".kaggle-tpu-lab.json"
 
 WEIGHTS_DATASET = "rahim3/qwen3-8-27b-bf16"
 ENV_DATASET = "rahim3/qwen38-tpu-env-v5e8"   # XLA compile cache + cloudflared + manifest
+HF_MODEL_ID = "Qwen/Qwen3.8-27B"
+SERVED_MODEL_NAME = "qwen3.8-27b"
 
 # Friendly one-liners for each phase the kernel publishes.
 PHASE_TEXT = {
@@ -40,6 +42,7 @@ PHASE_TEXT = {
     "cache-missing":      "No compile cache found — cold compile, add ~10 min.",
     "weights-mounted":    "Weights found mounted (no download needed).",
     "weights-download":   "Downloading weights from Hugging Face (~5 min)...",
+    "weights-progress":   None,
     "weights-downloaded": "Weights downloaded.",
     "server-launch":      "Starting vLLM — loading 55 GB of weights, then TPU graph compile...",
     "tunnel-url":         None,
@@ -62,6 +65,26 @@ def kaggle(*args, capture=True):
 
 def say(msg):
     print(time.strftime("[%H:%M] "), msg, flush=True)
+
+
+def optional_dataset(value):
+    """Turn CLI spellings for 'no dataset' into None."""
+    value = (value or "").strip()
+    return None if value.lower() in ("", "none", "null", "-") else value
+
+
+def save_state(state):
+    STATE_FILE.write_text(json.dumps(state))
+    STATE_FILE.chmod(0o600)
+
+
+def api_key_hint(state):
+    """Return a useful label without copying a Kaggle Secret to local disk."""
+    if state.get("api_key"):
+        return state["api_key"]
+    if state.get("api_key_secret"):
+        return f"(Kaggle Secret: {state['api_key_secret']})"
+    return "(generated in the Kaggle output)"
 
 
 def check_auth():
@@ -88,17 +111,24 @@ def cmd_serve(args):
     user = kaggle_username(args.user)
     slug = args.slug
     topic = "ktl-" + uuid.uuid4().hex[:20]
-    api_key = "sk-" + secrets.token_hex(16)
+    api_key = "" if args.api_key_secret else "sk-" + secrets.token_hex(16)
 
+    weights_dataset = optional_dataset(args.weights_dataset)
     cfg = {
         "ntfy_topic": topic,
         "api_key": api_key,
+        "api_key_secret": args.api_key_secret,
         "max_model_len": args.max_model_len,
         "max_num_seqs": args.max_num_seqs,
         "mtp_tokens": args.mtp,
         "reasoning_effort_default": args.reasoning_effort,
         "keepalive_min": args.keepalive_min,
-        "weights_dataset": args.weights_dataset,
+        "weights_dataset": weights_dataset,
+        "hf_model_id": args.hf_model_id,
+        "served_model_name": args.served_model_name,
+        "cloudflare_hostname": args.cloudflare_hostname,
+        "cloudflare_token_secret": args.cloudflare_token_secret,
+        "hf_disable_xet": not args.use_xet,
     }
     if args.no_tools:
         cfg["tool_call_parser"] = ""
@@ -118,6 +148,9 @@ def cmd_serve(args):
     with tempfile.TemporaryDirectory() as td:
         td = Path(td)
         (td / "serve_qwen38.py").write_text(src)
+        dataset_sources = [ENV_DATASET]
+        if weights_dataset:
+            dataset_sources.insert(0, weights_dataset)
         (td / "kernel-metadata.json").write_text(json.dumps({
             "id": f"{user}/{slug}",
             "title": slug,
@@ -128,7 +161,7 @@ def cmd_serve(args):
             "enable_gpu": "false",
             "enable_tpu": "true",
             "enable_internet": "true",
-            "dataset_sources": [args.weights_dataset, ENV_DATASET],
+            "dataset_sources": dataset_sources,
             "competition_sources": [], "kernel_sources": [], "model_sources": [],
         }, indent=1))
         say(f"Pushing kernel {user}/{slug} (TPU v5e-8)...")
@@ -141,13 +174,14 @@ def cmd_serve(args):
                 say(f"WARNING: {line.strip()} — the kernel will still run, "
                     "but may need to download weights / compile cold.")
 
-    STATE_FILE.write_text(json.dumps(
-        {"kernel": f"{user}/{slug}", "topic": topic, "api_key": api_key}))
+    state = {"kernel": f"{user}/{slug}", "topic": topic, "api_key": api_key,
+             "api_key_secret": args.api_key_secret}
+    save_state(state)
     say("Pushed. Kaggle takes a few minutes to provision the TPU and attach the "
         "datasets; the endpoint is usually live ~22 min after the kernel starts.")
     say("Watching progress (Ctrl-C is safe — the server keeps running; "
         "`python launch.py status` re-attaches, `... stop` kills it).")
-    watch(f"{user}/{slug}", topic)
+    watch(f"{user}/{slug}", topic, api_key=api_key_hint(state))
 
 
 def read_events(topic, since):
@@ -172,7 +206,7 @@ def read_events(topic, since):
     return events
 
 
-def render_event(ev):
+def render_event(ev, api_key=None):
     phase = ev.get("phase", "?")
     if phase == "compiling":
         say(f"Loading / compiling... {ev.get('elapsed_s', 0) // 60} min elapsed "
@@ -183,6 +217,9 @@ def render_event(ev):
         else:
             say("XLA compile cache restored, but not for this config — its graphs "
                 "compile cold (add ~10 min).")
+    elif phase == "weights-progress":
+        say(f"Weights still downloading: {ev.get('downloaded_gb', '?')} GB cached, "
+            f"{ev.get('free_gb', '?')} GB free, {ev.get('elapsed_s', 0) // 60} min elapsed.")
     elif phase == "tunnel-url":
         say(f"Endpoint URL reserved: {ev.get('endpoint')}  (not live yet — wait for the banner)")
     elif phase == "serving":
@@ -194,7 +231,7 @@ def render_event(ev):
         print("\n" + "=" * 66)
         print("  YOUR ENDPOINT IS LIVE")
         print(f"  base URL : {ev['endpoint']}")
-        print(f"  API key  : {ev['api_key']}")
+        print(f"  API key  : {api_key or ev.get('api_key', '(see Kaggle output)')}")
         print(f"  model    : {ev['model']}   (context: {ev.get('max_model_len', '?')})")
         print("=" * 66)
         print("""
@@ -224,7 +261,7 @@ See the README for hooking this into Claude Code, Codex CLI, opencode, etc.
         say(text if text else f"{phase} {json.dumps({k: v for k, v in ev.items() if k != 'phase'})}")
 
 
-def watch(kernel, topic):
+def watch(kernel, topic, api_key=None):
     since = int(time.time()) - 600
     last_status = None
     seen_boot = False
@@ -233,7 +270,7 @@ def watch(kernel, topic):
             for ts, ev in read_events(topic, since):
                 since = max(since, ts)
                 seen_boot = True
-                render_event(ev)
+                render_event(ev, api_key=api_key)
                 if ev.get("phase") in ("failed", "auto-shutdown", "stopped"):
                     return
             since = max(since, int(time.time()) - 1) if seen_boot else since
@@ -284,8 +321,7 @@ def cmd_build_env(args):
         out = (r.stdout or "") + (r.stderr or "")
         if "successfully pushed" not in out:
             sys.exit(f"Push failed:\n{out.strip()}")
-    STATE_FILE.write_text(json.dumps({"kernel": f"{user}/{args.slug}", "topic": topic,
-                                      "api_key": ""}))
+    save_state({"kernel": f"{user}/{args.slug}", "topic": topic, "api_key": ""})
     say(f"Pushed {user}/{args.slug}. It serves each config once (~1.5 h total) and "
         "leaves xla_cache.tar / cloudflared / manifest.json in its output.")
     watch(f"{user}/{args.slug}", topic)
@@ -304,11 +340,11 @@ def cmd_status(args):
     say(((r.stdout or "") + (r.stderr or "")).strip())
     events = read_events(st["topic"], int(time.time()) - 24 * 3600)
     for _, ev in events[-8:]:
-        render_event(ev)
+        render_event(ev, api_key=api_key_hint(st))
     if any(ev.get("phase") == "ready" for _, ev in events):
-        say(f"API key: {st['api_key']}")
+        say(f"API key: {api_key_hint(st)}")
     if args.follow:
-        watch(st["kernel"], st["topic"])
+        watch(st["kernel"], st["topic"], api_key=api_key_hint(st))
 
 
 def cmd_stop(args):
@@ -331,16 +367,30 @@ def main():
                    help="context length (default: native 262k; use 131072 with "
                         "--max-num-seqs 16 for max multi-stream throughput)")
     s.add_argument("--max-num-seqs", type=int, default=4)
-    s.add_argument("--mtp", type=int, default=3,
-                   help="MTP speculative tokens (0 disables). +34%% decode in our A/B test; made "
-                        "lossless by the bundled GDN state-rollback patch "
-                        "(verified 12/12 greedy exact-match)")
+    s.add_argument("--mtp", type=int, default=0,
+                   help="speculative decoding tokens (default 0 for stability; vllm-tpu "
+                        "0.28.0 may crash on some request shapes when MTP is enabled)")
     s.add_argument("--reasoning-effort", default="xhigh",
                    choices=["xhigh", "medium", "low"],
                    help="server-side default; clients can still override per request")
-    s.add_argument("--keepalive-min", type=int, default=480,
-                   help="auto-shutdown after this many minutes of serving")
-    s.add_argument("--weights-dataset", default=WEIGHTS_DATASET)
+    s.add_argument("--keepalive-min", type=int, default=180,
+                   help="auto-shutdown after this many minutes of serving (default: 180)")
+    s.add_argument("--hf-model-id", default=HF_MODEL_ID,
+                   help="Hugging Face model to download when no weights dataset is mounted")
+    s.add_argument("--served-model-name", default=SERVED_MODEL_NAME,
+                   help="model name exposed by the OpenAI-compatible API")
+    s.add_argument("--cloudflare-hostname", default="",
+                   help="fixed hostname configured on a Cloudflare named tunnel")
+    s.add_argument("--cloudflare-token-secret", default="CF_TUNNEL_TOKEN",
+                   help="Kaggle Secret label containing the named-tunnel token")
+    s.add_argument("--api-key-secret", default="",
+                   help="Kaggle Secret label containing a stable endpoint API key; "
+                        "the CLI otherwise generates a new key")
+    s.add_argument("--weights-dataset", default=WEIGHTS_DATASET,
+                   help="Kaggle weights dataset, or 'none' to download --hf-model-id")
+    s.add_argument("--use-xet", action="store_true",
+                   help="opt into hf-xet high-performance downloads; plain HTTP is the "
+                        "more reliable default on Kaggle")
     s.add_argument("--no-tools", action="store_true",
                    help="disable tool-calling support")
     s.add_argument("--text-only", action="store_true",
