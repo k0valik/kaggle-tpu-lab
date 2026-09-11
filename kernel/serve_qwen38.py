@@ -42,7 +42,7 @@ CFG = None  # __LAUNCHER_CONFIG__  (launch.py replaces this line)
 
 DEFAULTS = {
     "vllm_tpu_version": "0.28.0",
-    "weights_dataset": "rahim3/qwen3-8-27b-bf16",     # HF mirror of Qwen/Qwen3.8-27B
+    "weights_dataset": "tonyrishwain/qwen38-27b-uncensored-bf16",     # HF mirror of Qwen/Qwen3.8-27B
     "env_dataset": "rahim3/qwen38-tpu-env-v5e8",       # XLA cache + cloudflared + manifest
     "hf_model_id": "Qwen/Qwen3.8-27B",                # fallback download source
     "max_model_len": 262144,       # native context; drop to 131072 + max_num_seqs 16 for throughput
@@ -61,7 +61,7 @@ DEFAULTS = {
     "fast_start": False,           # True: skip precompile -> READY in ~4 min (needs the env
                                    # dataset's cache); the script then warms the common
                                    # request shapes itself; rare shapes stall once (~1 min)
-    "keepalive_min": 480,          # auto-shutdown guard (Kaggle TPU caps at 9h anyway)
+    "keepalive_min": 540,          # auto-shutdown guard (Kaggle TPU caps at 9h anyway)
     "api_key": "",                 # generated if empty
     "ntfy_topic": "",              # optional: publish progress to ntfy.sh/<topic>
     "served_model_name": "qwen3.8-27b",

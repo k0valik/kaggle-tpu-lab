@@ -27,8 +27,9 @@ HERE = Path(__file__).resolve().parent
 KERNEL_SRC = HERE / "kernel" / "serve_qwen38.py"
 STATE_FILE = Path.home() / ".kaggle-tpu-lab.json"
 
-WEIGHTS_DATASET = "rahim3/qwen3-8-27b-bf16"
+WEIGHTS_DATASET = "tonyrishwain/qwen38-27b-uncensored-bf16"
 ENV_DATASET = "rahim3/qwen38-tpu-env-v5e8"   # XLA compile cache + cloudflared + manifest
+PUBLIC_NOTEBOOK_TEMPLATE = "tonyrishwain/qwen38-tpu-server-template"
 
 # Friendly one-liners for each phase the kernel publishes.
 PHASE_TEXT = {
@@ -82,6 +83,65 @@ def kaggle_username(cli_arg):
         return m.group(1).strip("'\"")
     sys.exit("Could not detect your Kaggle username — pass it with --user <name>.")
 
+def notebook_cell_source(cell):
+    """Return a notebook cell's source as one string."""
+    src = cell.get("source", "")
+
+    if isinstance(src, list):
+        return "".join(src)
+
+    return src
+
+
+def set_notebook_cell_source(cell, text):
+    """Set notebook source using normal .ipynb line-array representation."""
+    cell["source"] = text.splitlines(keepends=True)
+
+
+def inject_notebook_config(nb_path, cfg):
+    """Replace the public template's __LAUNCHER_CONFIG__ cell."""
+    nb = json.loads(nb_path.read_text())
+
+    matches = []
+
+    for cell in nb.get("cells", []):
+        if cell.get("cell_type") != "code":
+            continue
+
+        if "__LAUNCHER_CONFIG__" in notebook_cell_source(cell):
+            matches.append(cell)
+
+    if len(matches) != 1:
+        raise RuntimeError(
+            "Expected exactly one notebook cell containing "
+            "'__LAUNCHER_CONFIG__'; found "
+            f"{len(matches)}"
+        )
+
+    # repr() gives us a Python dict literal, just like the old launcher.
+    source = f"""# __LAUNCHER_CONFIG__
+import json
+from pathlib import Path
+
+LAUNCH_CFG = {cfg!r}
+
+Path("serve_config.json").write_text(
+    json.dumps(LAUNCH_CFG, indent=2)
+)
+
+print("Launcher configuration written")
+"""
+
+    set_notebook_cell_source(matches[0], source)
+
+    # Remove any outputs inherited from the public template.
+    for cell in nb.get("cells", []):
+        if cell.get("cell_type") == "code":
+            cell["execution_count"] = None
+            cell["outputs"] = []
+
+    nb_path.write_text(json.dumps(nb, indent=1))
+
 
 def cmd_serve(args):
     check_auth()
@@ -109,45 +169,143 @@ def cmd_serve(args):
     if args.fast_start:
         cfg["fast_start"] = True
 
-    src = KERNEL_SRC.read_text()
-    src, n = re.subn(r"^CFG = None  # __LAUNCHER_CONFIG__.*$",
-                     f"CFG = {cfg!r}", src, count=1, flags=re.M)
-    if n != 1:
-        sys.exit("kernel/serve_qwen38.py is missing the __LAUNCHER_CONFIG__ line")
+    with tempfile.TemporaryDirectory() as td_name:
+        td = Path(td_name)
 
-    with tempfile.TemporaryDirectory() as td:
-        td = Path(td)
-        (td / "serve_qwen38.py").write_text(src)
-        (td / "kernel-metadata.json").write_text(json.dumps({
-            "id": f"{user}/{slug}",
-            "title": slug,
-            "code_file": "serve_qwen38.py",
-            "language": "python",
-            "kernel_type": "script",
-            "is_private": "true",
-            "enable_gpu": "false",
-            "enable_tpu": "true",
-            "enable_internet": "true",
-            "dataset_sources": [args.weights_dataset, ENV_DATASET],
-            "competition_sources": [], "kernel_sources": [], "model_sources": [],
-        }, indent=1))
-        say(f"Pushing kernel {user}/{slug} (TPU v5e-8)...")
-        r = kaggle("kernels", "push", "-p", str(td))
+        say(
+            f"Pulling notebook template "
+            f"{PUBLIC_NOTEBOOK_TEMPLATE}..."
+        )
+
+        r = kaggle(
+            "kernels",
+            "pull",
+            PUBLIC_NOTEBOOK_TEMPLATE,
+            "-p", str(td),
+            "-m",
+        )
+
+        if r.returncode != 0:
+            out = (r.stdout or "") + (r.stderr or "")
+            sys.exit(
+                "Could not pull public notebook template:\n"
+                + out.strip()
+            )
+
+        notebooks = list(td.glob("*.ipynb"))
+
+        if len(notebooks) != 1:
+            sys.exit(
+                "Expected exactly one .ipynb from template; "
+                f"found {[p.name for p in notebooks]}"
+            )
+
+        nb_path = notebooks[0]
+
+        say(f"Injecting run configuration into {nb_path.name}...")
+
+        inject_notebook_config(
+            nb_path,
+            cfg,
+        )
+
+        metadata_path = td / "kernel-metadata.json"
+
+        if not metadata_path.exists():
+            sys.exit(
+                "Template pull did not return kernel-metadata.json"
+            )
+
+        metadata = json.loads(
+            metadata_path.read_text()
+        )
+
+        # CRITICAL:
+        # Pulled notebooks may contain id_no. Kaggle gives id_no
+        # precedence over id, so remove it when cloning.
+        metadata.pop("id_no", None)
+
+        # Turn the public template into this user's PRIVATE run.
+        metadata["id"] = f"{user}/{slug}"
+        metadata["title"] = slug
+        metadata["code_file"] = nb_path.name
+        metadata["language"] = "python"
+        metadata["kernel_type"] = "notebook"
+        metadata["is_private"] = "true"
+
+        # Keep the working template's TPU / machine-shape fields,
+        # but make these explicit too.
+        metadata["enable_gpu"] = "false"
+        metadata["enable_tpu"] = "true"
+        metadata["enable_internet"] = "true"
+
+        # Dynamic weights choice from launch.py.
+        metadata["dataset_sources"] = [
+            args.weights_dataset,
+            ENV_DATASET,
+        ]
+
+        metadata.setdefault("competition_sources", [])
+        metadata.setdefault("kernel_sources", [])
+        metadata.setdefault("model_sources", [])
+
+        metadata_path.write_text(
+            json.dumps(metadata, indent=1)
+        )
+
+        say(
+            f"Pushing private notebook "
+            f"{user}/{slug} (TPU v5e-8)..."
+        )
+
+        r = kaggle(
+            "kernels",
+            "push",
+            "-p", str(td),
+        )
+
         out = (r.stdout or "") + (r.stderr or "")
-        if "successfully pushed" not in out:
-            sys.exit(f"Push failed:\n{out.strip()}")
+
+        if r.returncode != 0:
+            sys.exit(
+                "Push failed:\n"
+                + out.strip()
+            )
+
+        if "successfully pushed" not in out.lower():
+            say(out.strip())
+
         for line in out.splitlines():
             if "not valid dataset sources" in line:
-                say(f"WARNING: {line.strip()} — the kernel will still run, "
-                    "but may need to download weights / compile cold.")
+                say(
+                    f"WARNING: {line.strip()} — "
+                    "the notebook will still run, but may need "
+                    "to download weights / compile cold."
+                )
 
-    STATE_FILE.write_text(json.dumps(
-        {"kernel": f"{user}/{slug}", "topic": topic, "api_key": api_key}))
-    say("Pushed. Kaggle takes a few minutes to provision the TPU and attach the "
-        "datasets; the endpoint is usually live ~22 min after the kernel starts.")
-    say("Watching progress (Ctrl-C is safe — the server keeps running; "
-        "`python launch.py status` re-attaches, `... stop` kills it).")
-    watch(f"{user}/{slug}", topic)
+    STATE_FILE.write_text(
+        json.dumps({
+            "kernel": f"{user}/{slug}",
+            "topic": topic,
+            "api_key": api_key,
+        })
+    )
+
+    say(
+        "Pushed notebook. Kaggle is provisioning the TPU "
+        "and attaching datasets."
+    )
+
+    say(
+        "Watching progress (Ctrl-C is safe — the server keeps running; "
+        "`python launch.py status` re-attaches, "
+        "`python launch.py stop` kills it)."
+    )
+
+    watch(
+        f"{user}/{slug}",
+        topic,
+    )
 
 
 def read_events(topic, since):
