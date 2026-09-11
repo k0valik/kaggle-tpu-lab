@@ -1,5 +1,12 @@
 # kaggle-tpu-lab
 
+For the maintained interactive workflow, import
+[`notebook/qwen38-tpu-draft.ipynb`](notebook/qwen38-tpu-draft.ipynb).
+See the [Draft runbook and incident summary (繁體中文)](docs/DRAFT_RUNBOOK.zh-TW.md)
+for dataset mounting, queue monitoring, Cloudflare recovery, and session shutdown.
+Importing into Kaggle is a separate step from pushing this repository.
+The throughput figures below are upstream measurements, not guarantees for the custom checkpoint.
+
 **Serve Qwen3.8-27B — a frontier-class 27B hybrid-attention model — on Kaggle's free
 TPU v5e-8, with a public OpenAI-compatible endpoint you can plug into Claude Code,
 Codex CLI, opencode, or anything else that speaks the OpenAI API.**
