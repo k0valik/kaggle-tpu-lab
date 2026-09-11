@@ -66,6 +66,7 @@ DEFAULTS = {
     "served_model_name": "qwen3.8-27b",
     "cloudflare_hostname": "",     # named tunnel hostname, e.g. llm.example.com
     "cloudflare_token_secret": "CF_TUNNEL_TOKEN",  # Kaggle Secret label (never the token)
+    "cloudflare_protocol": "auto",  # auto first; reconnects fall back between auto and http2
     "hf_disable_xet": True,       # plain HTTP is slower but avoids observed hf-xet stalls on Kaggle
     "verbose": False,              # show every vLLM log line (always saved to vllm.log)
     "build_bundle": False,         # maintainer mode: build the env dataset instead of serving
@@ -218,15 +219,23 @@ def validate_model_snapshot(model_path):
 
 
 def fetch_cloudflared():
-    if CLOUDFLARED.exists():
-        return
+    """Refresh cloudflared on every launch and replace the old copy atomically."""
+    download = CLOUDFLARED.with_name(CLOUDFLARED.name + ".download")
     try:
-        urllib.request.urlretrieve(
-            "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64",
-            CLOUDFLARED)
-        CLOUDFLARED.chmod(0o755)
+        with urllib.request.urlopen(
+                "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64",
+                timeout=60) as response, download.open("wb") as output:
+            shutil.copyfileobj(response, output)
+        download.chmod(0o755)
+        version = subprocess.check_output(
+            [str(download), "--version"], text=True, stderr=subprocess.STDOUT,
+            timeout=15).strip()
+        download.replace(CLOUDFLARED)
+        log(f"   refreshed {version}")
     except Exception as e:
-        log(f"(cloudflared download failed: {e})")
+        raise RuntimeError("Fresh cloudflared download/validation failed; refusing stale binary") from e
+    finally:
+        download.unlink(missing_ok=True)
 
 
 def kaggle_secret(label):
@@ -303,7 +312,9 @@ def install_runtime(built=None):
 
 # ---------------- 1. runtime ----------------
 banner(1, "Python runtime", f"vllm-tpu {CFG['vllm_tpu_version']}")
-threading.Thread(target=fetch_cloudflared, daemon=True).start()
+# Keep STEP 5 from racing ahead with a stale binary copied from the env dataset.
+# The official binary is ~40 MB and normally downloads in under a second.
+fetch_cloudflared()
 bundle_root = find_input(CFG["env_dataset"].split("/")[-1], "qwen38-tpu-env*")
 bundle, manifest = None, {}
 if bundle_root:
@@ -314,9 +325,6 @@ if bundle_root:
         manifest = json.loads(Path(hits[0]).read_text())
     else:
         bundle = bundle_root
-if bundle and Path(bundle, "cloudflared").exists() and not CLOUDFLARED.exists():
-    shutil.copy(Path(bundle, "cloudflared"), CLOUDFLARED)
-    CLOUDFLARED.chmod(0o755)
 if manifest and (manifest.get("python") != PY_VER
                  or manifest.get("vllm_tpu_version") != CFG["vllm_tpu_version"]):
     log(f"   env dataset was built for python {manifest.get('python')} / vllm-tpu "
@@ -838,15 +846,26 @@ elif cf_hostname:
     log("   fixed hostname disabled: cloudflared is unavailable")
 cf_lines = []
 cf_lock = threading.Lock()
+reported_tunnel_pids = set()
+tunnel_protocol = "auto"
 
-def start_tunnel():
+def start_tunnel(protocol=None):
     """Start cloudflared. Named tunnels keep the same URL across reconnects."""
+    global tunnel_protocol
     if cf_hostname:
         if not cf_token:
             return None
-        # UDP/QUIC is unreliable from Kaggle; named tunnels support HTTP/2.
-        cmd = [str(CLOUDFLARED), "tunnel", "--no-autoupdate",
-               "--protocol", "http2", "run"]
+        protocol = (protocol or CFG.get("cloudflare_protocol", "auto")).strip().lower()
+        if protocol not in {"auto", "http2", "quic"}:
+            log(f"   invalid cloudflare_protocol={protocol!r}; using auto")
+            protocol = "auto"
+        # Let cloudflared negotiate by default. If the connector exits, the watcher
+        # retries with HTTP/2 (TCP) and alternates thereafter.
+        cmd = [str(CLOUDFLARED), "tunnel", "--no-autoupdate"]
+        if protocol != "auto":
+            cmd += ["--protocol", protocol]
+        cmd += ["run"]
+        tunnel_protocol = protocol
         child_env = {**os.environ, "TUNNEL_TOKEN": cf_token}
     else:
         cmd = [str(CLOUDFLARED), "tunnel", "--url", f"http://127.0.0.1:{PORT}",
@@ -864,13 +883,26 @@ def start_tunnel():
     threading.Thread(target=pump_cf, args=(proc,), daemon=True).start()
     return proc
 
+
+def report_tunnel_exit(proc, protocol):
+    """Expose actionable diagnostics without ever putting the token on the command line."""
+    if proc.pid in reported_tunnel_pids:
+        return
+    reported_tunnel_pids.add(proc.pid)
+    time.sleep(0.2)  # allow the stdout pump to drain after process exit
+    with cf_lock:
+        tail = list(cf_lines[-5:])
+    log(f"   cloudflared exited (rc={proc.returncode}, protocol={protocol})")
+    for line in tail:
+        log("   cloudflared:", line.replace(cf_token, "<redacted>") if cf_token else line)
+
 if CLOUDFLARED.exists():
     tunnel = start_tunnel()
     if cf_hostname and tunnel:
         # The hostname-to-localhost route is stored in Cloudflare, not in this notebook.
         time.sleep(3)
         if tunnel.poll() is not None:
-            log("   named tunnel exited during startup; see cloudflared lines in vllm.log")
+            report_tunnel_exit(tunnel, tunnel_protocol)
     elif not cf_hostname:
         pat = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com")
         deadline = time.time() + 180
@@ -903,12 +935,16 @@ if cf_hostname and tunnel:
             if tunnel.poll() is None:
                 failures = 0
                 continue
+            failed_protocol = tunnel_protocol
+            report_tunnel_exit(tunnel, failed_protocol)
             failures += 1
             delay = min(60, 2 ** min(failures, 5))
-            publish("tunnel-reconnecting", endpoint=f"{url}/v1", retry_secs=delay)
-            log(f"   cloudflared disconnected; reconnecting fixed tunnel in {delay} s")
+            next_protocol = "http2" if failed_protocol == "auto" else "auto"
+            publish("tunnel-reconnecting", endpoint=f"{url}/v1", retry_secs=delay,
+                    protocol=next_protocol)
+            log(f"   cloudflared disconnected; retrying with {next_protocol} in {delay} s")
             time.sleep(delay)
-            replacement = start_tunnel()
+            replacement = start_tunnel(next_protocol)
             if replacement is not None:
                 tunnel = replacement
     threading.Thread(target=watch_tunnel, daemon=True).start()
