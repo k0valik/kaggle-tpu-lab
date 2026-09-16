@@ -239,6 +239,36 @@ def install_runtime(built=None):
     return "pip" if rc == 0 else None
 
 
+def sanitize_tpu_env():
+    """Kaggle's image derives TPU_WORKER_HOSTNAMES / TPU_WORKER_ADDRS from its cluster metadata, and when that
+    lookup fails the variables end up holding the lookup's WARNING text instead of addresses — libtpu then refuses
+    to start ("INVALID_ARGUMENT: Error: unexpected worker hostname 'WARNING: could not determine ...'"). A v5e-8
+    on Kaggle is a single VM holding all 8 chips, so PJRT never needs these variables: drop any value that does not
+    look like a plain address list."""
+    dropped = []
+    for name in ("TPU_WORKER_HOSTNAMES", "TPU_WORKER_ADDRS"):
+        val = os.environ.get(name)
+        if val is not None and (not val.strip() or re.search(r"WARNING|ERROR|could not|failed", val, re.I)):
+            del os.environ[name]
+            dropped.append(f"{name}={val.strip()[:70]!r}")
+    if dropped:
+        log("   cleared broken TPU metadata env vars (a single-VM TPU does not need them): " + ", ".join(dropped))
+
+
+def internet_check():
+    """A session without Internet fails every DNS lookup (pip, cloudflared, ntfy) and spends ~10 minutes in pip
+    retries before erroring out. Ask PyPI first (~2 s) so the run stops here with a plain message instead."""
+    try:
+        urllib.request.urlopen("https://pypi.org/simple/pip/", timeout=20).read(1)
+        log("   Internet check OK")
+    except Exception as e:  # noqa: BLE001
+        msg = (f"no Internet from this session ({str(e)[:120]}): Session options -> Internet ON (a phone-verified "
+               "Kaggle account is needed for that), then run again. The pip packages and the tunnel need it.")
+        log("   " + msg)
+        publish("failed", step="no-internet", tail=msg)
+        sys.exit(1)
+
+
 def tpu_check():
     """Kaggle sometimes starts a "TPU" session with no TPU attached (a CPU-only container; most often on new or
     not-yet-verified accounts). jax then sees one device and vLLM dies minutes later with "Insufficient devices for
@@ -270,7 +300,9 @@ def tpu_check():
     msg = (f"this session has no working TPU: jax sees {n} {platform} device(s) {rest}. Kaggle sometimes starts a "
            "TPU session without one (most often on new or not-yet-verified accounts); nothing in this notebook can "
            "fix that. Stop the session and start it again. If it repeats, run `import jax; print(jax.device_count())` "
-           "in a fresh cell first: it must print 8 before this script is worth running.")
+           "in a fresh cell first: it must print 8 before this script is worth running. Some accounts also need full "
+           "identity verification (KYC via Persona) before Kaggle grants TPU access — phone verification alone is "
+           "not always enough (check kaggle.com/settings).")
     log("   " + msg)
     publish("failed", step="no-tpu", tail=msg)
     sys.exit(1)
@@ -295,7 +327,11 @@ def server_death_report(max_lines=60):
             break
     joined = "\n".join(block)
     hint = ""
-    if re.search(r"found 1, expected 8|jellyfish|unexpected worker hostname|TPU initialization failed", joined):
+    if "unexpected worker hostname" in joined:
+        hint = ("the session exported a broken TPU_WORKER_HOSTNAMES value (Kaggle's metadata lookup failed and the "
+                "WARNING text landed in the variable); this kernel now clears that variable before starting vLLM — "
+                "run again and it should not come back")
+    elif re.search(r"found 1, expected 8|jellyfish|TPU initialization failed", joined):
         hint = ("this session has no working TPU (Kaggle sometimes starts one without, most often on new or "
                 "not-yet-verified accounts): stop the session and start it again")
     elif "__delitem__" in joined:
@@ -303,6 +339,10 @@ def server_death_report(max_lines=60):
                 "vllm-tpu 0.28.0 cannot handle: set \"async_scheduling\": false (or \"mtp_tokens\": 0) and run again")
     elif "RESOURCE_EXHAUSTED" in joined or "out of memory" in joined.lower():
         hint = "the TPU ran out of HBM: lower max_model_len or max_num_seqs"
+    elif cause:
+        hint = ("no known cause matched: a crash this early on a real TPU is most often a flaky start or this pinned "
+                "runtime vs a newer Kaggle base image — run the session again once, and if it repeats open an issue "
+                "with /kaggle/working/vllm.log attached")
     return cause, joined, hint
 
 
@@ -310,6 +350,15 @@ def server_died(server, phase, **extra):
     """Log why the vLLM server exited (root cause first), publish it, and stop the kernel."""
     cause, block, hint = server_death_report()
     tail = "\n".join(list(server.tail)[-40:]) if getattr(server, "tail", None) else ""
+    if server.returncode == 0 and not cause:
+        # a clean exit well before the keepalive window is not the scheduled shutdown: the session itself was
+        # almost certainly stopped from outside (a "Save & Run All" commit ends when the run finishes, and an
+        # interactive session ends when Kaggle stops it) — say so instead of a bare rc=0
+        hint = (hint or "the server exited cleanly before the scheduled auto-shutdown "
+                        f"(that only fires after {CFG['keepalive_min']} min of serving): the notebook session itself "
+                        "was most likely stopped from outside. A 'Save & Run All (Commit)' run ends the moment the "
+                        "notebook finishes — the serving cell must run in an interactive session that stays open. "
+                        "Run the notebook again and leave the last cell running.")
     log(f"server exited rc={server.returncode}" + (f" — root cause: {cause}" if cause else ""))
     if hint:
         log(f"   -> {hint}")
@@ -326,7 +375,9 @@ def server_died(server, phase, **extra):
 
 # ---------------- 1. runtime ----------------
 banner(1, "Python runtime", f"vllm-tpu {CFG['vllm_tpu_version']}")
+sanitize_tpu_env()
 tpu_check()
+internet_check()
 threading.Thread(target=fetch_cloudflared, daemon=True).start()
 bundle_root = find_input(CFG["env_dataset"].split("/")[-1], "qwen38-tpu-env*")
 bundle, manifest = None, {}
