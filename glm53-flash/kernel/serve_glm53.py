@@ -148,16 +148,16 @@ def sanitize_tpu_env():
     """Kaggle's image derives TPU_WORKER_HOSTNAMES / TPU_WORKER_ADDRS from its cluster metadata, and when that
     lookup fails the variables end up holding the lookup's WARNING text instead of addresses — libtpu then refuses
     to start ("INVALID_ARGUMENT: Error: unexpected worker hostname 'WARNING: could not determine ...'"). A v5e-8
-    on Kaggle is a single VM holding all 8 chips, so PJRT never needs these variables: drop any value that does not
-    look like a plain address list."""
+    on Kaggle is one VM holding all 8 chips, so PJRT never needs these variables at all: remove them outright
+    rather than guess which values are well-formed."""
     dropped = []
     for name in ("TPU_WORKER_HOSTNAMES", "TPU_WORKER_ADDRS"):
-        val = os.environ.get(name)
-        if val is not None and (not val.strip() or re.search(r"WARNING|ERROR|could not|failed", val, re.I)):
-            del os.environ[name]
+        val = os.environ.pop(name, None)
+        if val is not None:
             dropped.append(f"{name}={val.strip()[:70]!r}")
     if dropped:
-        log("   cleared broken TPU metadata env vars (a single-VM TPU does not need them): " + ", ".join(dropped))
+        log("   removed TPU metadata env vars (a single-VM TPU does not need them, and a broken value stops "
+            "libtpu): " + ", ".join(dropped))
 
 
 def preflight():

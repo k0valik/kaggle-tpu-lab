@@ -243,16 +243,16 @@ def sanitize_tpu_env():
     """Kaggle's image derives TPU_WORKER_HOSTNAMES / TPU_WORKER_ADDRS from its cluster metadata, and when that
     lookup fails the variables end up holding the lookup's WARNING text instead of addresses — libtpu then refuses
     to start ("INVALID_ARGUMENT: Error: unexpected worker hostname 'WARNING: could not determine ...'"). A v5e-8
-    on Kaggle is a single VM holding all 8 chips, so PJRT never needs these variables: drop any value that does not
-    look like a plain address list."""
+    on Kaggle is one VM holding all 8 chips, so PJRT never needs these variables at all: remove them outright
+    rather than guess which values are well-formed."""
     dropped = []
     for name in ("TPU_WORKER_HOSTNAMES", "TPU_WORKER_ADDRS"):
-        val = os.environ.get(name)
-        if val is not None and (not val.strip() or re.search(r"WARNING|ERROR|could not|failed", val, re.I)):
-            del os.environ[name]
+        val = os.environ.pop(name, None)
+        if val is not None:
             dropped.append(f"{name}={val.strip()[:70]!r}")
     if dropped:
-        log("   cleared broken TPU metadata env vars (a single-VM TPU does not need them): " + ", ".join(dropped))
+        log("   removed TPU metadata env vars (a single-VM TPU does not need them, and a broken value stops "
+            "libtpu): " + ", ".join(dropped))
 
 
 def internet_check():
@@ -308,11 +308,17 @@ def tpu_check():
     sys.exit(1)
 
 
+_LOG_START = 0   # byte offset in RAW_LOG where the current server run's output begins (set by launch_server)
+
+
 def server_death_report(max_lines=60):
     """What killed vLLM, from vllm.log: the root-cause exception line, the first error block and a hint for the
-    causes we have seen. The console tail alone scrolls the cause away. Returns (cause, block, hint)."""
+    causes we have seen. The console tail alone scrolls the cause away. Only the current run's lines are scanned
+    (from _LOG_START): the log is opened in append mode, so a rerun after a failed one would otherwise report the
+    previous run's cause. Returns (cause, block, hint)."""
     try:
-        lines = [l for l in RAW_LOG.read_text(errors="replace").splitlines() if l.startswith("[vllm]")]
+        data = RAW_LOG.read_bytes()[_LOG_START:]
+        lines = [l for l in data.decode("utf-8", errors="replace").splitlines() if l.startswith("[vllm]")]
     except Exception:  # noqa: BLE001
         return "", "", ""
     strip = re.compile(r"^\[vllm\] (?:\((?:EngineCore|APIServer|Worker)[^)]*\) )?(?:ERROR|CRITICAL) [\d-]+ [\d:]+ \[[^\]]+\] ?")
@@ -339,16 +345,19 @@ def server_death_report(max_lines=60):
                 "vllm-tpu 0.28.0 cannot handle: set \"async_scheduling\": false (or \"mtp_tokens\": 0) and run again")
     elif "RESOURCE_EXHAUSTED" in joined or "out of memory" in joined.lower():
         hint = "the TPU ran out of HBM: lower max_model_len or max_num_seqs"
-    elif cause:
-        hint = ("no known cause matched: a crash this early on a real TPU is most often a flaky start or this pinned "
-                "runtime vs a newer Kaggle base image — run the session again once, and if it repeats open an issue "
-                "with /kaggle/working/vllm.log attached")
     return cause, joined, hint
 
 
 def server_died(server, phase, **extra):
     """Log why the vLLM server exited (root cause first), publish it, and stop the kernel."""
     cause, block, hint = server_death_report()
+    if not hint and cause:
+        # phase-gated: "failed" is the startup wait, "stopped" is the serve loop — a late failure hours into
+        # serving should not be described as a startup crash
+        hint = ("no known cause matched: attach /kaggle/working/vllm.log to an issue if it repeats"
+                + (" — a crash during startup on a real TPU is most often a flaky start or this pinned runtime "
+                   "vs a newer Kaggle base image, so running the session again once is worth a try"
+                   if phase == "failed" else ""))
     tail = "\n".join(list(server.tail)[-40:]) if getattr(server, "tail", None) else ""
     if server.returncode == 0 and not cause:
         # a clean exit well before the keepalive window is not the scheduled shutdown: the session itself was
@@ -577,10 +586,12 @@ def make_translator():
 
 
 def launch_server(cfg):
+    global _LOG_START
     publish("server-launch", max_model_len=cfg["max_model_len"],
             max_num_seqs=cfg["max_num_seqs"], mtp=cfg["mtp_tokens"],
             text_only=cfg["text_only"], min_token_bucket=cfg["min_token_bucket"])
     tail = collections.deque(maxlen=200)
+    _LOG_START = RAW_LOG.stat().st_size   # server_death_report scans only from here (the log is append-mode)
     p = subprocess.Popen(server_args(cfg), stdout=subprocess.PIPE,
                          stderr=subprocess.STDOUT, text=True, env=os.environ.copy())
     tr = make_translator()
