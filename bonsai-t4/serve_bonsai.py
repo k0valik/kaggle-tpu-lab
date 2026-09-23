@@ -181,9 +181,11 @@ pkill -x llama-server 2>/dev/null; sleep 2
 BIN={BIN}
 MODEL="/tmp/models/{MODEL_FILE}"
 # Dual T4: layer split across both cards; single T4: all on one.
-# PQ2_0 = 7.21 GB, fits easily; 65536 ctx stays conservative for KV + vision slack.
+# 128000 ctx primary (KV ~8.2 GB f16 on the hybrid backbone + 7.21 GB weights,
+# split across 2x16 GB); ladder falls back if allocation fails.
 # reasoning_effort=medium is required (xhigh default -> empty answers, weak abliteration).
 for FLAGS in \\
+  "{base} -ngl 99 -c 128000 -fa on" \\
   "{base} -ngl 99 -c 65536 -fa on" \\
   "{base} -ngl 99 -c 32768 -fa on" \\
   "-ngl 99 -c 32768 -fa on" \\

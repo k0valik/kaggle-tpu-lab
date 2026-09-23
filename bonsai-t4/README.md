@@ -24,7 +24,7 @@ kaggle kernels push -p <dir with both files>
 3. **Download** `Ternary-Bonsai-2-27B-Abliterated-PQ2_0.gguf` (7.21 GB).
 4. **Launch** with `--chat-template-kwargs '{"reasoning_effort": "medium"}'`
    (required — template default `xhigh` gives empty answers / weaker abliteration),
-   ladder: dual/single `-ngl 99` @ 65536 → 32768 ctx → CPU fallback.
+   ladder: dual/single `-ngl 99` @ **128000** → 65536 → 32768 ctx → CPU fallback.
 5. Tunnel + READY banner + self-test + keepalive, same pattern as the ornith kernel.
    Progress on ntfy topic `ktl-bonsai-6d2f8e1a4b7c3905`.
 
@@ -37,7 +37,7 @@ kaggle kernels push -p <dir with both files>
 | CPU fallback | ~2-3 tok/s |
 
 Reference: L4 = 29.8 tok/s TG128 on PQ2_0 per PrismML's table; T4 derated ~30-50%.
-7.21 GB on 16 GB cards leaves lots of room; 65536 ctx is conservative on purpose.
+7.21 GB weights split across 2×16 GB; 128000 ctx adds ~8.2 GB f16 KV (hybrid backbone) — ladder falls back if it doesn't fit.
 
 ## Wiring into opencode
 
