@@ -1,44 +1,42 @@
-# Ornith-1.5-35B-A3B (CRACK) on Kaggle P100 (llama.cpp)
+# Ornith-1.5-35B-A3B (CRACK) — Kaggle TPU v5e-8 / P100 dual-path (llama.cpp / vllm-tpu)
 
-Serve `dealignai/Ornith-1.5-35B-A3B-UNCENSORED-GGUF` (CRACK-abliterated MoE) through an
-OpenAI-compatible API on Kaggle's free **GPU P100** via llama.cpp. Text-only (no mmproj
-— it would eat the VRAM headroom this needs for 256k context).
+Serve `Ornith-1.5-35B-A3B` (CRACK-abliterated MoE) through an OpenAI-compatible API.
+One script, two hardware paths — the kernel checks what it was given:
+
+1. **TPU v5e-8** (`/dev/apex_*` present) → bf16 safetensors
+   (`huihui-ai/Huihui-Ornith-1.5-35B-A3B-abliterated`, ~70 GB) via vllm-tpu 0.28.0,
+   TP=8, 262k ctx, text-only. **Experimental**: `qwen3_5_moe` support in vllm-tpu
+   0.28.0 is unverified — if the engine rejects the arch, the log says so explicitly.
+   No compile-cache dataset for this model: cold start ~35-50 min.
+2. **GPU P100** (`nvidia-smi`) → llama.cpp, **Q4_K** (21.7 GB). Q4_K > 16 GB VRAM, so
+   routed experts are split with `--n-cpu-moe`: the ladder tries 20 → 30 → 40 layers'
+   experts on CPU (VRAM ~14.7 → 10.5 → 6 GB), then a 131072-ctx fallback. First healthy
+   config wins. Decode ~25-50 tok/s (experts partially CPU-resident, mmap'd from SSD).
+3. **Neither** → clear failure message (the known Kaggle silent-CPU-fallback case).
 
 ## Files
 
-- `ornith-1.5-35b-a3b-p100.ipynb` — the notebook. Import at kaggle.com
-  (Code → New Notebook → File → Import Notebook), set **Accelerator = GPU P100** and
-  **Internet = ON**, then run all.
-- `serve_ornith.py` + `kernel-metadata.json` — same pipeline as a pushable script kernel:
-  ```bash
-  kaggle kernels push -p ornith/    # needs ~/.kaggle/kaggle.json
-  kaggle kernels status mikiasendale/ornith-p100-serve
-  ```
-  Progress (and the endpoint once live) publishes to ntfy topic
-  `ktl-ornith-3f9c2b7e51a04d68`.
+- `ornith-1.5-35b-a3b-p100.ipynb` — the manual P100 notebook (Q4_K ladder).
+- `serve_ornith.py` — the dual-path script kernel (same file for both accelerators).
+- `kernel-metadata.json` — push as **GPU P100**: `kaggle kernels push -p ornith/`
+- `kernel-metadata-tpu.json` — push as **TPU**: copy over `kernel-metadata.json`,
+  edit the slug to taste, push (`enable_tpu: true`).
+
+Progress publishes to ntfy topic `ktl-ornith-3f9c2b7e51a04d68` (both paths).
 
 ## What to expect
 
-| | Ornith P100 (this folder) | Qwen3.8 P100 (`../`) | TPU v5e-8 (repo root) |
-|---|---|---|---|
-| Model | GGUF Q2_K, 13.25 GB (35B MoE, 8+1 experts active ≈ 3B/token) | GGUF UD-Q2_K_XL, 10 GB (27B dense) | bf16 safetensors |
-| Decode | ~40-90 tok/s (est.) | ~15-22 tok/s (measured) | ~130 tok/s (measured, Qwen3.8) |
-| Context | 262144 native (q4_0 KV ≈ 1.3 GB — only 10 full-attn layers × 2 KV heads) | 128000 | 262144 |
-| Time to READY | ~6-8 min | ~6-8 min | ~22 min (different arch: unverified) |
-
-The ~2-4x decode gain over the 27B dense comes from reading only ~0.9 GB of active
-weights per token instead of the whole 14 GB model. Prefill stays Pascal-slow
-(~1-2k tok/s est.), so very long prompts still take a while to ingest.
-
-## VRAM math (why the ladder matters)
-
-13.25 GB model + 1.34 GB KV (q4_0 @ 262144) + compute buffers ≈ 15-16 GB — right at the
-P100's limit. The launcher tries `-fa on + q4_0 KV` at ngl 99 → 90 → 80 → 60, then
-`-fa off` (f16 KV, lower ngl) before giving up. Don't load the mmproj alongside 256k.
+| | P100 — Q4_K split | TPU v5e-8 — bf16 (if supported) |
+|---|---|---|
+| Weights | GGUF Q4_K 21.7 GB (experts CPU/GPU split) | bf16 safetensors ~70 GB of 128 GB HBM |
+| Decode | ~25-50 tok/s (est.) | ~150-300 tok/s (est.) |
+| Context | 262144 (q4_0 KV ≈ 1.3 GB) | 262144 |
+| Time to READY | ~8-10 min (bigger download) | ~35-50 min (cold compile) |
+| Risk | low | medium (arch support unverified) |
 
 ## Wiring into opencode
 
-Same key as the other kernels; alias is `Ornith-1.5-35B-A3B-CRACK`:
+Same key and alias on both paths (`Ornith-1.5-35B-A3B-CRACK`):
 
 ```jsonc
 "baseURL": "https://<xxx>.trycloudflare.com/v1",
