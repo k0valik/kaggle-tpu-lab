@@ -34,7 +34,9 @@ all) for unverified accounts and during fleet pressure — the API pushes silent
 back to CPU-only containers that crash at mesh init with
 `Insufficient devices for 2D mesh: found 1, expected 8`. Phone-verify the account,
 then retry. A slower but reliable P100 (GGUF/llama.cpp) fallback lives in
-[`p100/`](p100/README.md).
+[`p100/`](p100/README.md); its Ornith variant auto-detects TPU-vs-P100 at runtime
+([`p100/ornith/`](p100/ornith/)), and a ternary 2-bit Bonsai-2 kernel targets T4×2
+([`bonsai-t4/`](bonsai-t4/)).
 
 ## Why this works (the one-paragraph version)
 
