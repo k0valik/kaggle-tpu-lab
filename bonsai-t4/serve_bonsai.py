@@ -43,8 +43,10 @@ fi
     if p.returncode != 0:
         return ""
     for attempt in range(3):
+        # NOTE: never `pkill -f cloudflared` here - the pattern matches this very
+        # shell's command line and kills it before nohup runs (empty tunnel.log).
         subprocess.run(["bash", "-lc",
-            "pkill -x llama-server 2>/dev/null; pkill -f cloudflared 2>/dev/null; sleep 1; "
+            "rm -f /tmp/logs/tunnel.log; pkill -x cloudflared 2>/dev/null; sleep 1; "
             "nohup /tmp/cloudflared tunnel --url http://127.0.0.1:8080 --no-autoupdate "
             "> /tmp/logs/tunnel.log 2>&1 &"], capture_output=True, text=True)
         for _ in range(45):
@@ -56,7 +58,11 @@ fi
                     return m.group(0)
             except Exception:
                 pass
-        say(f"tunnel attempt {attempt + 1}/3 failed - retrying")
+        try:
+            tail = Path("/tmp/logs/tunnel.log").read_text(errors="replace")[-300:]
+        except Exception:
+            tail = "(no tunnel.log - launch shell died)"
+        say(f"tunnel attempt {attempt + 1}/3 failed: {tail.strip()}")
     return ""
 
 def go_live(URL):
