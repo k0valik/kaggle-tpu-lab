@@ -40,6 +40,23 @@ hygiene, foreground fetch), PR #5 (state `0600`).
    migration story).
 6. Regenerate affected notebook cells.
 
+## PRs consulted (double-pass)
+
+- [#6](https://github.com/k0valik/kaggle-tpu-lab/pull/6) (qdubois):
+  Pinned-download + pre-exec re-hash logic, `--host 127.0.0.1`, `redact()`,
+  atomic `0600` state, `.gitignore` entries. IGNORE env-dataset deletion,
+  benchmark-deleting README. REVIEW (decide in build): full HMAC
+  `sign/verify` protocol, `SESSION_DIR` isolation. Double-pass: re-check
+  `sync_security.py`/`test_hardening.py` patterns for the Stage E harness.
+- [#9](https://github.com/k0valik/kaggle-tpu-lab/pull/9) (KiVixx):
+  Named tunnel (`start_tunnel`/`watch_tunnel`), `TUNNEL_TOKEN` env,
+  `KTL_API_KEY`-style secret, foreground fetch, `--use-xet`. IGNORE
+  uncensored notebooks/hostnames, zh-TW runbook, queue monitor (macOS-only;
+  at most re-check its abstract "never infer Running from Starting" rule).
+- [#5](https://github.com/k0valik/kaggle-tpu-lab/pull/5) (Kitkitkittt):
+  only the `download_checked` (resume+sha256+size) and `safe_extract`
+  idioms, if they fit the pinned-download implementation.
+
 ## Non-goals
 
 No cache deletion, no protocol breaks, no benchmark-deleting doc rewrites,

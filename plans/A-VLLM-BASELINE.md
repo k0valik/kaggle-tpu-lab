@@ -46,6 +46,16 @@ re-validate every 0.28.0-era assumption before later stages build on them.
    `Qwen/Qwen3.8-27B` needs it on the new version).
 7. Regenerate the Qwen notebook cell from the edited kernel.
 
+## PRs consulted (double-pass)
+
+- [#1](https://github.com/k0valik/kaggle-tpu-lab/pull/1) (phakoda, OrcaRouter
+  FP8): only the `--trust-remote-code` question was relevant — verdict
+  NEEDS-LIVE-TEST, not added. Everything else ignored (new-checkpoint
+  feature). Re-check in double-pass: does the FP8 path need anything else
+  version-gated?
+- No other PR touched the vLLM version pin. (Prefix-cache `#3422` and
+  structured-output `#3463` findings came from upstream research, not PRs.)
+
 ## Non-goals
 
 No weights-source changes (Stage B), no tunnel changes (Stage D), no doc

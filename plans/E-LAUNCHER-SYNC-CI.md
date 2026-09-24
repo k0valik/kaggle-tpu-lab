@@ -40,6 +40,27 @@ construction, and gate it all with CI that runs without Kaggle/TPU.
 5. Regenerate both notebooks via the new tool; verify embedded cells
    match sources.
 
+## PRs consulted (double-pass)
+
+- [#4](https://github.com/k0valik/kaggle-tpu-lab/pull/4) (tonyrishwain):
+  `metadata.pop("id_no", None)` + explicit `enable_*` flags + returncode
+  push check. IGNORE the notebook-template pull/push rewrite, personal
+  template ID, `keepalive 540`. Double-pass: re-check the cell-helper
+  functions (`notebook_cell_source`/`inject_notebook_config`) in case a
+  template flow is ever wanted — currently rejected.
+- [#5](https://github.com/k0valik/kaggle-tpu-lab/pull/5) (Kitkitkittt):
+  `.github/workflows/check.yml` shape, `sync_notebook.py --check` pattern,
+  `notebook/kernel-metadata.json` (`TpuV5E8`, `dataset_sources`) — with IDs
+  adapted to `k0valik`/upstream, not the fork's.
+- [#9](https://github.com/k0valik/kaggle-tpu-lab/pull/9) (KiVixx):
+  `tools/sync_notebooks.py` concept (kernel → `%%writefile` cell, strip
+  outputs) minus the personal-draft generation lines. Double-pass: confirm
+  no sync requirement was missed (e.g. `BUILD_CONFIGS` vs launcher flags).
+- [#7](https://github.com/k0valik/kaggle-tpu-lab/pull/7) (nxhung1610,
+  DFlash2): rejected as a feature, but record the abstract rule in a code
+  comment if a speculative-method branch is ever touched: methods are
+  mutually exclusive, alt method skips `apply_mtp_patch()`.
+
 ## Non-goals
 
 No notebook-template pull/push rewrite (PR #4 flow rejected), no new

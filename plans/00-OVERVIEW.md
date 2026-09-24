@@ -47,3 +47,22 @@ operating rules; this file is the stage index.
   with the exact command run.
 - Orchestrator validates output against the stage acceptance list, then
   commits (one commit per stage, `Ref: #N` attributions).
+
+## PR reference map (double-pass checklist)
+
+All open PRs on `k0valik/kaggle-tpu-lab` — semantic references only, never
+merge candidates. Raw diffs archived at `/tmp/opencode/pr-diffs/pr-N.diff`
+(local only; re-fetch with `gh pr diff N` if missing). After all stages
+land, do a second pass over each PR against this table to catch misses.
+
+| PR | Author | Title | Verdict summary | Stage(s) |
+|---|---|---|---|---|
+| [#1](https://github.com/k0valik/kaggle-tpu-lab/pull/1) | phakoda | OrcaRouter FP8 path | IGNORE feature; LIFT token-plumbing idea, runtime-secret hygiene, FP8-cache rule, trust-remote-code question | A, B |
+| [#2](https://github.com/k0valik/kaggle-tpu-lab/pull/2) | chynggi | Serve finetunes, not just base | LIFT `*.jinja`, token, `chat_template()` fallback, `hf_token()` chain, empty-dataset filter; IGNORE presets/wrappers | B |
+| [#3](https://github.com/k0valik/kaggle-tpu-lab/pull/3) | xiaotian1171 | Huihui abliterated + weights builder | IGNORE defaults/docs; REVIEW generic `find_input()` fallbacks (landed), parameterized `build-weights` (split later) | B |
+| [#4](https://github.com/k0valik/kaggle-tpu-lab/pull/4) | tonyrishwain | Notebook template/weights + tunnel fix | LIFT `id_no` pop + returncode push check; claimed tunnel fix has no hunk | E |
+| [#5](https://github.com/k0valik/kaggle-tpu-lab/pull/5) | Kitkitkittt | Guides + fail-fast | LIFT `tpu_topology_ok()`, state `0600`, CI, sync `--check`, preflight cells; IGNORE GPU path | C, E (+D idioms) |
+| [#6](https://github.com/k0valik/kaggle-tpu-lab/pull/6) | qdubois | Secrets out, tunnel downloads | LIFT pinned-cloudflared logic, `--host 127.0.0.1`, redact, atomic `0600`; IGNORE env-dataset deletion | D |
+| [#7](https://github.com/k0valik/kaggle-tpu-lab/pull/7) | nxhung1610 | DFlash2 TPU | IGNORE entirely (new drafter); keep only the abstract mutual-exclusion rule | none |
+| [#8](https://github.com/k0valik/kaggle-tpu-lab/pull/8) | codewith-aditya | Fix kaggle issues | LIFT `sanitize_tpu_env()`, `internet_check()`, `_LOG_START`, `server_died()` hints; IGNORE KYC prose, backslash regression | C |
+| [#9](https://github.com/k0valik/kaggle-tpu-lab/pull/9) | KiVixx | Stable custom endpoint | LIFT `optional_dataset()`, HF preflight/validation, XET toggle, secrets plumbing, named tunnel, sync concept; IGNORE uncensored notebooks, zh-TW doc, queue monitor | B, D, E |

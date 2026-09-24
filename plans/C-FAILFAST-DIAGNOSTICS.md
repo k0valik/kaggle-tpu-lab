@@ -37,6 +37,19 @@ rerun failures to old runs. References: PR #5 (Kitkitkittt:
    table — regenerated from kernel, no fork URLs.
 8. Regenerate affected notebook cells.
 
+## PRs consulted (double-pass)
+
+- [#5](https://github.com/k0valik/kaggle-tpu-lab/pull/5) (Kitkitkittt):
+  `tpu_topology_ok()` gate + notebook preflight cells + troubleshooting
+  table. IGNORE GPU path, fork URLs. Double-pass: re-check
+  `download_checked`/`safe_extract` idioms (parked for Stage D) and whether
+  the `INPUT_AUDIT.md` synthesis notes hold anything missed.
+- [#8](https://github.com/k0valik/kaggle-tpu-lab/pull/8) (codewith-aditya):
+  `sanitize_tpu_env()`, `internet_check()`, `_LOG_START` triple,
+  `server_died()` hints, scheduler-exit line. IGNORE KYC prose, INT8 essay,
+  backslash regression. Double-pass: re-check the `server_death_report`
+  hint-split hunk (parked as REVIEW — subsumed by the sanitizer?).
+
 ## Non-goals
 
 No KYC prose, no bf16-vs-INT8 essays (PR #8 docs rejected). No GPU

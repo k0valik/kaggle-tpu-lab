@@ -51,6 +51,27 @@ third-party checkpoint.
    `*.jinja` support. Skip if it bloats the stage; can split to B2.
 8. Regenerate the Qwen notebook cell from the edited kernel.
 
+## PRs consulted (double-pass)
+
+- [#2](https://github.com/k0valik/kaggle-tpu-lab/pull/2) (chynggi, finetunes):
+  LIFTED `*.jinja` + token in `snapshot_download`, `chat_template()`
+  fallback, `hf_token()` chain, empty-dataset filter. IGNORED presets,
+  `quickstart.sh/ps1`, `--served-model-name` docs angle (flag itself taken).
+  Double-pass: re-check the config-compat pre-flight script idea (REVIEW).
+- [#1](https://github.com/k0valik/kaggle-tpu-lab/pull/1) (phakoda, FP8):
+  LIFTED runtime-secret hygiene (preferred over #2's `--hf-token` embed)
+  and the FP8-must-not-reuse-BF16-cache rule (landed + hardened to a fresh
+  empty dir). IGNORED `launch_fp8.py` wrapper, sentinels, FP8 docs.
+- [#3](https://github.com/k0valik/kaggle-tpu-lab/pull/3) (xiaotian1171):
+  LIFTED generic `find_input()` fallbacks. IGNORED Huihui defaults/docs.
+  OPEN: parameterized `build-weights` flow (split to later — double-pass
+  must decide: implement or drop).
+- [#9](https://github.com/k0valik/kaggle-tpu-lab/pull/9) (KiVixx):
+  LIFTED `optional_dataset()`, `HfApi` preflight, `HF_HUB_DISABLE_XET`,
+  validation + progress (log-lines-only chosen over the progress thread).
+  Secrets/named-tunnel parts belong to Stage D, not B — double-pass must
+  confirm nothing weights-related was left (e.g. `--use-xet` flag is D).
+
 ## Non-goals
 
 No third-party checkpoint presets, no `quickstart.sh/ps1`, no

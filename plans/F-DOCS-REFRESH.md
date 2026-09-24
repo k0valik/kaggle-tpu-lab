@@ -32,6 +32,20 @@ start early.
 5. Delete or version-stamp every 0.28.0-era claim (grep `0.28.0`,
    `tpu-inference#3178`, `3178` and disposition each hit).
 
+## PRs consulted (double-pass)
+
+- No PR is a docs source verbatim (most README hunks sell disallowed
+  checkpoints or fork URLs). Reusable doc concepts only:
+  [#2](https://github.com/k0valik/kaggle-tpu-lab/pull/2)'s
+  config-compat check description (if the tool lands),
+  [#9](https://github.com/k0valik/kaggle-tpu-lab/pull/9)'s named-tunnel /
+  secrets / `none`-dataset passages (rewritten, not copied),
+  [#8](https://github.com/k0valik/kaggle-tpu-lab/pull/8)'s failure
+  modes (already covered by Stage C troubleshooting cells — deduplicate,
+  don't duplicate).
+- Double-pass must grep every README for each ignored PR's checkpoint IDs
+  and fork URLs to prove none leaked in.
+
 ## Non-goals
 
 No new benchmarks invented locally (numbers come from live runs or are
