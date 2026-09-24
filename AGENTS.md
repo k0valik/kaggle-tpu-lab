@@ -37,6 +37,22 @@ All consolidation work happens on top of that baseline.
    - Exception the owner explicitly wants: **generic configurable Qwen3.8-27B weights source** — the prebaked BF16 Kaggle dataset stays default, but the user can serve their **own FP8 quant or any compatible checkpoint** either (a) as an uploaded Kaggle dataset or (b) as an `--hf-model-id` HuggingFace download. Generalize, never hardcode a third-party checkpoint.
 3. **Latest vLLM release is the baseline.** `qwen38-27b/README.md` numbers and the `vllm-tpu==0.28.0` pin are stale (PyPI shows a Sep-2026 `vllm-tpu` release). Re-validate on lift: MTP rollback patch (`patches/mtp-rollback-v0280.diff`, port of `tpu-inference#3178`), prefix-caching enablement, `--no-async-scheduling` / `__delitem__` JSON-mode bug, `--trust-remote-code` need, cloudflared pin digest.
 
+## Validation policy (owner has no Kaggle access yet)
+
+- All validation is **semantic/local only** until the owner connects Kaggle
+  and live-tests on a real TPU. Never claim a change is live-verified.
+- Runnable locally without Kaggle/TPU: `python3 -m py_compile` on touched
+  Python files, notebook JSON-validity (`json.load`), sync-check tools
+  (`--check` once Phase E lands), pure-function unit tests
+  (e.g. `optional_dataset`, `sanitize_*`, `validate_model_snapshot`,
+  `complete_bf16_repo` against fixtures, patch embed/decode roundtrip).
+- Not runnable locally: kernel boot, XLA compile/cache-hit, vLLM serve,
+  tunnel, ntfy flow, endpoint probes. Mark every stage's acceptance as
+  "semantic" vs "deferred-live" explicitly.
+- Each stage in `plans/` is self-contained: a build subagent gets only its
+  stage file + repo checkout. The orchestrator (main agent) validates
+  subagent output against the stage's acceptance list before committing.
+
 ## Source of truth
 
 - `qwen38-27b/kernel/serve_qwen38.py` is source of truth for Qwen. Notebook `qwen38-27b/notebook/qwen38-tpu-serve.ipynb` is a **generated copy** — edit the kernel, regenerate, never hand-diverge.
