@@ -7,7 +7,17 @@ companion keeps its own `CHANGELOG-0.4.5.txt`.)
 
 ## Unreleased
 
-- Stage E (next): launcher robustness + single-source sync + CI.
+- Stage F (next): docs refresh (see `plans/F-DOCS-REFRESH.md`), then the
+  double-pass over all 9 PRs.
+
+## 2026-09-24 — `0d92566` — Stage E: launcher hardening + sync + CI
+
+- Push handling hardened at all three sites (fail on returncode, note
+  on output drift); metadata audit proved no `id_no` footgun exists.
+- `tools/sync_notebook.py` ends hand-sync drift: content-located cells,
+  both recipes, `--check` mode (GLM byte-identical to old generator).
+- Minimal CI (compile + 38 tests + sync check + JSON, no publishing,
+  minutes-cheap) and a contract test pinning the frozen Tauri surface.
 
 ## 2026-09-24 — `bcec5be` — Stage B2: free-CPU-kernel weights builder
 
