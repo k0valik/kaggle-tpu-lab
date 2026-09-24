@@ -7,8 +7,15 @@ companion keeps its own `CHANGELOG-0.4.5.txt`.)
 
 ## Unreleased
 
-- Stage F (next): docs refresh (see `plans/F-DOCS-REFRESH.md`), then the
-  double-pass over all 9 PRs.
+- Double-pass over all 9 PRs (see `plans/00-OVERVIEW.md` reference map).
+
+## 2026-09-24 — `308396e` — Stage F: docs refresh
+
+- Both READMEs brought onto the new baseline: stale 0.28.0-era numbers
+  explicitly marked (not silently kept), version references at 0.29.0,
+  new docs for custom checkpoints, `build-weights`, fail-fast gates,
+  named tunnel + stable key, and the sync/CI workflow. Every stale
+  claim swept and dispositioned.
 
 ## 2026-09-24 — `0d92566` — Stage E: launcher hardening + sync + CI
 
