@@ -8,6 +8,16 @@ That merge added the Tauri tray app + 4 recipe hunks
 state `model/submitted_at/keepalive_min`, `complete_bf16_repo` + `*.jinja`).
 All consolidation work happens on top of that baseline.
 
+## CHANGELOG.md (keep in sync)
+
+- Every substantial commit adds an entry to `CHANGELOG.md`: date,
+  commit hash, one-line summary, a few bullets on what changed and why.
+- Per-commit detail stays in `git log`; the changelog is the
+  human-readable layer above it (companion app keeps its own
+  `CHANGELOG-0.4.5.txt`; do not mix the two).
+- Stages land one entry each; the "Unreleased" section tracks in-flight
+  work.
+
 ## Tauri companion app (vendored, frozen)
 
 - `src/`, `src-tauri/`, `scripts/`, `package*.json`, `vite.config.ts`,
