@@ -7,7 +7,18 @@ companion keeps its own `CHANGELOG-0.4.5.txt`.)
 
 ## Unreleased
 
-- Double-pass over all 9 PRs (see `plans/00-OVERVIEW.md` reference map).
+- Live TPU validation (owner): re-measurement, MTP A/B (bf16 + FP8), APC
+  hit-rate, JSON-mode crash repro, trust-remote-code probe, named-tunnel
+  e2e, build-weights CPU landing.
+
+## 2026-09-24 — `f62b1da` — Double-pass over all 9 PRs
+
+- Six sequential verifications (V1–V6), then one fix batch. Result: no
+  MISSED hunk in any PR — every idea is landed, parked with cause, or
+  rejected with cause; PRs are now closable with pointers.
+- Landed: config-compat cache reuse, MTP-head auto-fallback, XLA
+  tar-slip guard, 2 GLM ports, BUILD_CONFIGS pin + test, URL hygiene,
+  trust-remote-code/MTP-on-FP8/#3399 tracking. 54/54 tests green.
 
 ## 2026-09-24 — `308396e` — Stage F: docs refresh
 
