@@ -5,6 +5,8 @@ kaggle-tpu-lab launcher — serve a model on a free Kaggle TPU from your termina
     python launch.py serve                          # Qwen3.8-27B: push the kernel and watch it come up
     python launch.py serve --model glm53-flash      # GLM-5.3-Flash
     python launch.py serve --reasoning-effort medium --mtp 3
+    python launch.py build-weights --hf-model-id Qwen/Qwen3.8-27B
+                                     # mirror HF weights on free CPU (no TPU time burned)
     python launch.py status                # one-shot status + recent events
     python launch.py stop                  # kill the TPU session
 
@@ -418,6 +420,132 @@ def watch(kernel, topic, api_key=None):
             "re-attach, `python launch.py stop` to kill it.")
 
 
+# Template for the free-CPU weights-mirror kernel pushed by `build-weights`
+# (Stage B2). __REPO_ID__ is replaced with the JSON-quoted --hf-model-id at
+# push time. Everything else is runtime logic: the HF token is NEVER baked
+# into the pushed source — gated repos authenticate inside the kernel via the
+# HF_TOKEN env var or the Kaggle Secret labelled HF_TOKEN.
+BUILD_WEIGHTS_TEMPLATE = '''import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+REPO_ID = __REPO_ID__
+
+ALLOW_PATTERNS = ["*.safetensors", "*.json", "*.jinja", "*.txt",
+                  "tokenizer*", "vocab*", "merges*"]
+OUT_DIR = Path("/kaggle/working/weights")
+
+
+def resolve_token():
+    """Runtime-only HF auth: env HF_TOKEN first, else the Kaggle Secret
+    labelled HF_TOKEN (attach it under the kernel's Secrets add-on for
+    gated repos). Returns None for public repos."""
+    tok = os.environ.get("HF_TOKEN", "").strip()
+    if tok:
+        return tok
+    try:
+        from kaggle_secrets import UserSecretsClient
+        tok = (UserSecretsClient().get_secret("HF_TOKEN") or "").strip()
+        return tok or None
+    except Exception:
+        return None
+
+
+try:
+    from huggingface_hub import snapshot_download
+except ImportError:
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q",
+                           "huggingface_hub"])
+    from huggingface_hub import snapshot_download
+
+print("Downloading %s to %s ..." % (REPO_ID, OUT_DIR), flush=True)
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+t0 = time.time()
+snapshot_download(repo_id=REPO_ID, local_dir=str(OUT_DIR),
+                  allow_patterns=ALLOW_PATTERNS, token=resolve_token())
+secs = int(time.time() - t0)
+files = [p for p in OUT_DIR.rglob("*") if p.is_file()]
+total_gb = sum(p.stat().st_size for p in files) / 1e9
+print("Download complete in %ds: %d files, %.2f GB in %s"
+      % (secs, len(files), total_gb, OUT_DIR), flush=True)
+print("")
+print("Next steps (no TPU time burned):")
+print("  1. On this kernel's page, wait for status COMPLETE.")
+print("  2. Output tab -> New Dataset -> save /kaggle/working/weights.")
+print("  3. Attach it to the TPU run (kernel Add Input in the UI, or")
+print("     python launch.py serve --weights-dataset <user>/<dataset-slug>).")
+'''
+
+
+def cmd_build_weights(args):
+    """Push a free CPU kernel that mirrors a Hugging Face checkpoint to
+    /kaggle/working/weights (Stage B2). No TPU quota is burned on the ~55 GB
+    download; the owner creates a Kaggle dataset from the kernel output in
+    the UI and attaches it to the TPU run via --weights-dataset."""
+    check_auth()
+    user = kaggle_username(args.user)
+    repo = (args.hf_model_id or "").strip()
+    if not repo:
+        sys.exit("--hf-model-id must not be empty.")
+    slug = args.slug
+    kernel = f"{user}/{slug}"
+    say(f"Preparing CPU weights-mirror kernel for {repo} ...")
+    script = BUILD_WEIGHTS_TEMPLATE.replace("__REPO_ID__", json.dumps(repo))
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        (td / "download_weights.py").write_text(script)
+        (td / "kernel-metadata.json").write_text(json.dumps({
+            "id": kernel, "title": slug, "code_file": "download_weights.py",
+            "language": "python", "kernel_type": "script", "is_private": "true",
+            # CPU-only: no "machine_shape", no --accelerator push flag (the
+            # TPU serve path sends machine_shape TpuV5E8 + --accelerator
+            # TpuV5E8). No dataset_sources: this kernel downloads from HF.
+            "enable_gpu": "false", "enable_internet": "true",
+            "dataset_sources": [],
+            "competition_sources": [], "kernel_sources": [], "model_sources": [],
+        }, indent=1))
+        say(f"Pushing free CPU kernel {kernel} (no --accelerator: CPU default)...")
+        r = kaggle("kernels", "push", "-p", str(td))
+        out = (r.stdout or "") + (r.stderr or "")
+        if r.returncode != 0 or "successfully pushed" not in out.lower():
+            sys.exit(f"Push failed:\n{out.strip()}")
+    say(f"Pushed. Kernel page: https://www.kaggle.com/code/{user}/{slug}")
+    say("Polling kernel status (Ctrl-C is safe — the kernel keeps running)...")
+    # Finite job: poll `kernels status` only, no ntfy topic/watch() flow.
+    deadline = time.time() + 3 * 3600
+    last = None
+    try:
+        while True:
+            r = kaggle("kernels", "status", kernel)
+            out = (r.stdout or "") + (r.stderr or "")
+            m = re.search(r'"KernelWorkerStatus\.(\w+)"', out)
+            status = m.group(1) if m else "UNKNOWN"
+            if status != last:
+                say(f"Kernel status: {status}")
+                last = status
+            if status == "COMPLETE":
+                break
+            if status == "ERROR" or status.startswith("CANCEL"):
+                sys.exit(f"Kernel finished with status {status}:\n{out.strip()}\n"
+                         f"See https://www.kaggle.com/code/{user}/{slug}")
+            if time.time() > deadline:
+                sys.exit(f"Timed out waiting for {kernel} (last status: {last}).\n"
+                         f"Check https://www.kaggle.com/code/{user}/{slug}")
+            time.sleep(60)
+    except KeyboardInterrupt:
+        say("Detached. The kernel keeps running — re-run "
+            "`python launch.py build-weights` is NOT needed; check the kernel page.")
+        return
+    print("")
+    print("Weights mirrored. Create the dataset from the kernel output:")
+    print(f"  1. Open https://www.kaggle.com/code/{user}/{slug} (status COMPLETE).")
+    print("  2. Output tab -> New Dataset -> save /kaggle/working/weights.")
+    print("  3. Attach it to the TPU run (kernel Add Input in the UI, or")
+    print("     python launch.py serve --weights-dataset <user>/<dataset-slug>).")
+
+
 def cmd_build_env(args):
     """Maintainer flow. When the kernel finishes:
         kaggle kernels output <user>/<slug> -p bundle_out
@@ -555,6 +683,18 @@ def main():
                         "dataset), common request shapes are warmed right after; an "
                         "unusual request shape stalls ~1 min the first time")
     s.set_defaults(fn=cmd_serve)
+
+    s = sub.add_parser("build-weights", help="push a free CPU kernel that mirrors "
+                       "a Hugging Face checkpoint for dataset creation (no TPU time)")
+    s.add_argument("--hf-model-id", required=True,
+                   help="Hugging Face repo to mirror (e.g. Qwen/Qwen3.8-27B). "
+                        "Required, no default — no checkpoint is ever hardcoded. "
+                        "Gated repos authenticate at runtime via the HF_TOKEN "
+                        "Kaggle Secret (never embedded in the pushed source).")
+    s.add_argument("--user", help="Kaggle username (auto-detected if possible)")
+    s.add_argument("--slug", default="qwen38-weights-mirror",
+                   help="kernel name (default: %(default)s)")
+    s.set_defaults(fn=cmd_build_weights)
 
     s = sub.add_parser("build-env", help="(maintainers) push a kernel that builds the "
                        "env dataset: venv + XLA cache + cloudflared")
