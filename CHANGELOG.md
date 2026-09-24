@@ -7,8 +7,16 @@ companion keeps its own `CHANGELOG-0.4.5.txt`.)
 
 ## Unreleased
 
-- Stage B2 (next): free-CPU-kernel weights builder (see `plans/B-WEIGHTS-SOURCE.md`).
 - Stage E (next): launcher robustness + single-source sync + CI.
+
+## 2026-09-24 — `bcec5be` — Stage B2: free-CPU-kernel weights builder
+
+- New `launch.py build-weights --hf-model-id`: mirrors any HF checkpoint
+  via a free CPU kernel (no TPU quota burned), then guides dataset
+  creation for the TPU run. Adopted from PR #3's trick, generalized:
+  no hardcoded checkpoint, `*.jinja` included, runtime-only `HF_TOKEN`.
+- Deliberately stateless: never clobbers the TPU serve state that
+  `status`/`stop` depend on.
 
 ## 2026-09-24 — `63751fd` — Stage D: tunnel + supply-chain hardening
 
