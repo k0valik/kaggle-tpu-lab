@@ -7,7 +7,19 @@ companion keeps its own `CHANGELOG-0.4.5.txt`.)
 
 ## Unreleased
 
-- Stage B (next): generic Qwen3.8-27B weights source (see `plans/B-WEIGHTS-SOURCE.md`).
+- Stage C (next): fail-fast + honest diagnostics (see `plans/C-FAILFAST-DIAGNOSTICS.md`).
+
+## 2026-09-24 — `f4c7b56` — Stage B: generic Qwen3.8-27B weights source
+
+- Prebaked BF16 stays default; any compatible checkpoint now servable via
+  uploaded Kaggle dataset or `--hf-model-id` download (`--weights-dataset
+  none` = HF download). No third-party presets hardcoded.
+- Kernel: runtime `hf_token()` chain (never logged), `*.jinja` downloads,
+  `chat_template.jinja` fallback, HF size preflight + snapshot validation.
+- Non-default weights bypass the BF16 XLA cache via a fresh empty dir
+  (stale entries never consulted — correctness, not just messaging).
+- `tests/test_weights_source.py`: 12 unit tests green; notebook
+  regenerated; semantic-only validation, live runs deferred.
 
 ## 2026-09-24 — `140ab53` — Stage A: re-baseline onto `vllm-tpu==0.29.0`
 
