@@ -45,7 +45,11 @@ All consolidation work happens on top of that baseline.
 2. **Models: Qwen3.8-27B family only (primary).** `glm53-flash` is secondary and out of immediate scope — port generic infra to it only when free.
    - No new architectures, no new drafters (e.g. DFlash2), no hardcoded third-party checkpoints (uncensored/abliterated/FP8 presets) as features.
    - Exception the owner explicitly wants: **generic configurable Qwen3.8-27B weights source** — the prebaked BF16 Kaggle dataset stays default, but the user can serve their **own FP8 quant or any compatible checkpoint** either (a) as an uploaded Kaggle dataset or (b) as an `--hf-model-id` HuggingFace download. Generalize, never hardcode a third-party checkpoint.
-3. **Latest vLLM release is the baseline.** `qwen38-27b/README.md` numbers and the `vllm-tpu==0.28.0` pin are stale (PyPI shows a Sep-2026 `vllm-tpu` release). Re-validate on lift: MTP rollback patch (`patches/mtp-rollback-v0280.diff`, port of `tpu-inference#3178`), prefix-caching enablement, `--no-async-scheduling` / `__delitem__` JSON-mode bug, `--trust-remote-code` need, cloudflared pin digest.
+3. **Latest vLLM release is the baseline.** Since Stage A: `vllm-tpu==0.29.0`
+   (plugin; core 0.30.0 exists but the TPU plugin is 0.29.0 — nothing
+   missed). `qwen38-27b/README.md` numbers predate this; re-validate on
+   lift: MTP rollback patch (`patches/mtp-rollback-v0290.diff`, port of
+   `tpu-inference#3178`), prefix-caching enablement, `--no-async-scheduling` / `__delitem__` JSON-mode bug, `--trust-remote-code` need, cloudflared pin digest.
 
 ## Validation policy (owner has no Kaggle access yet)
 

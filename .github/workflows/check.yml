@@ -1,0 +1,41 @@
+# Stage E CI — LIGHTWEIGHT by owner constraint: stdlib only, no Kaggle/TPU,
+# no secrets, no Docker, no publish/deploy steps. Expected runtime well
+# under 2 minutes (py_compile + pure-function unit tests + sync --check +
+# notebook JSON parse, all local).
+name: check
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Compile all Python (no pip installs — stdlib only)
+        run: >
+          python3 -m py_compile launch.py tools/*.py tests/*.py
+          qwen38-27b/kernel/*.py qwen38-27b/tools/*.py
+          glm53-flash/kernel/*.py glm53-flash/tools/*.py
+
+      - name: Unit tests (pure functions — no Kaggle/TPU)
+        run: python3 -m unittest discover -s tests -v
+
+      - name: Notebooks in sync with kernels
+        run: >
+          tools/sync_notebook.py qwen38-27b --check &&
+          tools/sync_notebook.py glm53-flash --check
+
+      - name: Notebooks (+ kernel metadata, if present) parse as JSON
+        run: >
+          python3 -c "import glob, json;
+          files = sorted(glob.glob('*/notebook/*.ipynb') + glob.glob('**/kernel-metadata.json', recursive=True));
+          assert len(files) >= 2, files;
+          [json.load(open(f)) for f in files];
+          print('JSON OK:', files)"

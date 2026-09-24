@@ -255,8 +255,10 @@ def cmd_serve(args):
         say(f"Pushing kernel {user}/{slug} (TPU v5e-8)...")
         r = kaggle("kernels", "push", "-p", str(td), "--accelerator", "TpuV5E8")
         out = (r.stdout or "") + (r.stderr or "")
-        if r.returncode != 0 or "successfully pushed" not in out.lower():
+        if r.returncode != 0:
             sys.exit(f"Push failed:\n{out.strip()}")
+        if "successfully pushed" not in out.lower():
+            say(out.strip())
         for line in out.splitlines():
             if "not valid dataset sources" in line:
                 say(f"WARNING: {line.strip()} — the kernel will still run, "
@@ -509,8 +511,10 @@ def cmd_build_weights(args):
         say(f"Pushing free CPU kernel {kernel} (no --accelerator: CPU default)...")
         r = kaggle("kernels", "push", "-p", str(td))
         out = (r.stdout or "") + (r.stderr or "")
-        if r.returncode != 0 or "successfully pushed" not in out.lower():
+        if r.returncode != 0:
             sys.exit(f"Push failed:\n{out.strip()}")
+        if "successfully pushed" not in out.lower():
+            say(out.strip())
     say(f"Pushed. Kernel page: https://www.kaggle.com/code/{user}/{slug}")
     say("Polling kernel status (Ctrl-C is safe — the kernel keeps running)...")
     # Finite job: poll `kernels status` only, no ntfy topic/watch() flow.
@@ -575,8 +579,10 @@ def cmd_build_env(args):
         }, indent=1))
         r = kaggle("kernels", "push", "-p", str(td), "--accelerator", "TpuV5E8")
         out = (r.stdout or "") + (r.stderr or "")
-        if r.returncode != 0 or "successfully pushed" not in out.lower():
+        if r.returncode != 0:
             sys.exit(f"Push failed:\n{out.strip()}")
+        if "successfully pushed" not in out.lower():
+            say(out.strip())
     write_state({"kernel": f"{user}/{args.slug}", "topic": topic,
                  "api_key": "", "submitted_at": int(time.time())})
     say(f"Pushed {user}/{args.slug}. It serves each config once (~1.5 h total) and "
