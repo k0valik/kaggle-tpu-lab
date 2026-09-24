@@ -18,7 +18,9 @@ it, and a write-up of how it works and what we measured.
 
 Numbers are measured on the shipped configuration; the folder READMEs say how. Qwen runs on
 vllm-tpu with one patch. GLM-5.3-Flash runs on an engine we wrote in JAX for it; as far as we
-know it is the first to run that model on a TPU.
+know it is the first to run that model on a TPU. (Qwen's throughput table is
+0.28.0-era and stale since the 0.29.0 re-baseline — re-measurement on a live
+TPU is pending; see `qwen38-27b/README.md`.)
 
 ## What you need
 
@@ -45,14 +47,16 @@ Each folder README has the exact lines for Claude Code, Codex CLI and opencode.
 ## From a terminal
 
 ```bash
-git clone https://github.com/Haz4rdovisk/kaggle-tpu-lab
+git clone https://github.com/k0valik/kaggle-tpu-lab
 cd kaggle-tpu-lab
 python launch.py serve                       # Qwen3.8-27B
 python launch.py serve --model glm53-flash   # GLM-5.3-Flash
+python launch.py build-weights --hf-model-id OWNER/QUANT  # mirror any HF checkpoint via a free CPU kernel (Qwen)
 ```
 
 `launch.py` pushes the kernel with the Kaggle CLI and follows its progress; `status`
-and `stop` do what they say.
+and `stop` do what they say. `build-weights` burns no TPU time: it downloads on a
+free CPU kernel so you can make a weights dataset for the TPU run.
 
 ## Desktop companion (Windows)
 

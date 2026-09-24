@@ -7,6 +7,11 @@ Codex CLI, opencode, or anything else that speaks the OpenAI API.**
 No paid GPU, no cloud account, no quantization. Full bf16 weights, up to the model's
 native **262,144-token context**, and real speed:
 
+> **Stale numbers (0.28.0-era).** The table below was measured before the
+> `vllm-tpu==0.29.0` re-baseline and has not been re-run yet — treat it as
+> the shape of performance, not current figures. Re-measurement on a live
+  TPU is pending.
+
 | What | Measured (TPU v5e-8, bf16, TP=8) |
 |---|---|
 | Decode, single stream | **~130 tok/s** with MTP speculative decoding (78 without, measured before the token-bucket change) |
@@ -27,7 +32,8 @@ Qwen3.8-27B is a hybrid: 48 of its 64 layers are **gated-DeltaNet linear attenti
 16 are classic full attention. That makes its KV cache tiny (~64 KB/token), which is why a
 27B can serve 131k+ contexts on 8×16 GB TPU chips with room to spare. Until recently no TPU
 stack could run the DeltaNet layers — [vllm-tpu](https://github.com/vllm-project/tpu-inference)
-0.28.0 shipped native Pallas kernels for them (Aug 2026), and this repo is the recipe that
+ships native Pallas kernels for them (since 0.28.0, Aug 2026; this recipe now
+pins **0.29.0**), and this repo is the recipe that
 puts it all together on Kaggle's free tier: a pre-built Python runtime with pinned
 versions, pre-mirrored weights, a pre-built XLA compile cache, MTP speculative decoding,
 and a tunnel to the outside world.
@@ -53,10 +59,26 @@ pip install kaggle
 #   Linux/macOS: ~/.kaggle/kaggle.json     Windows: %USERPROFILE%\.kaggle\kaggle.json
 
 # 2. Get this repo and launch
-git clone https://github.com/ARahim3/kaggle-tpu-lab
+git clone https://github.com/k0valik/kaggle-tpu-lab
 cd kaggle-tpu-lab
 python launch.py serve
 ```
+
+### Step 0 (optional, saves TPU quota): mirror the weights first
+
+TPU time is scarce (~20 h/week); CPU kernels are free. Instead of downloading
+55 GB inside the TPU session, mirror any Hugging Face checkpoint once via a
+CPU kernel, make a dataset from its output, and attach it:
+
+```bash
+python launch.py build-weights --hf-model-id Qwen/Qwen3.8-27B
+# ...wait for COMPLETE, then in the Kaggle UI: kernel Output → New Dataset...
+python launch.py serve --weights-dataset <you>/<that-dataset>
+```
+
+Skip this and `serve` downloads from Hugging Face inside the TPU run instead
+(slower, burns quota, needs Internet ON). Gated repos authenticate at runtime
+via the `HF_TOKEN` Kaggle Secret — never on the command line.
 
 That's it. The launcher pushes a script kernel to your Kaggle account, and streams
 progress to your terminal so you always know what's happening:
@@ -69,7 +91,7 @@ progress to your terminal so you always know what's happening:
 [14:15]  Runtime ready.
 [14:15]  XLA compile cache restored for this exact config — fast start.
 [14:15]  Weights found mounted (no download needed).
-[14:15]  Starting vLLM — loading 55 GB of weights, then TPU graph compile...
+[14:15]  Starting vLLM — loading the checkpoint weights, then TPU graph compile...
 [14:15]  Endpoint URL reserved: https://xxxx-yyyy.trycloudflare.com/v1  (not live yet — wait for the banner)
 [14:19]  Loading / compiling... 4 min elapsed (typically ~20 min with the env dataset, ~35 min without)
 [14:35]  Server is HEALTHY after 20 min.
@@ -89,13 +111,27 @@ Useful flags (the default launch serves the **full native 262k context**, 4 conc
 sequences):
 
 ```bash
-python launch.py serve --max-model-len 131072 --max-num-seqs 16  # many parallel streams (~900 tok/s aggregate)
+python launch.py serve --max-model-len 131072 --max-num-seqs 16  # many parallel streams (~900 tok/s aggregate, 0.28.0-era figure)
 python launch.py serve --reasoning-effort medium                 # server-side default
 python launch.py serve --keepalive-min 120                       # auto-stop after 2 h
 python launch.py serve --text-only                               # skip the vision tower: ~10 min faster, no image inputs
 python launch.py serve --fast-start                              # live in ~6 min; common shapes warmed after, rare ones stall ~1 min once
 python launch.py serve --no-async-scheduling                     # for clients that use JSON mode / structured outputs with MTP on (see "If it fails")
 ```
+
+Serving your own checkpoint (e.g. an FP8 quant) instead of the prebaked bf16:
+
+```bash
+# (a) as an uploaded Kaggle dataset (mirror it first with build-weights, or upload directly)
+python launch.py serve --weights-dataset <you>/<your-weights> --hf-model-id <you>/<your-repo>
+# (b) as a straight Hugging Face download inside the TPU run
+python launch.py serve --weights-dataset none --hf-model-id <you>/<your-repo>
+python launch.py serve --served-model-name qwen3.8-27b-fp8        # name the API advertises
+```
+
+Notes: a non-default checkpoint does **not** reuse the prebaked bf16 XLA cache
+(different graphs — the kernel compiles cold, honestly and loudly). The served
+name defaults to `qwen3.8-27b`.
 
 
 ## Using it with coding agents
@@ -142,25 +178,34 @@ or turn thinking off entirely with `{"enable_thinking": false}`. To change the
 ## What's actually in this folder
 
 ```
-../launch.py                     the CLI at the repo root: serve / status / stop, with live progress
-kernel/serve_qwen38.py           the Kaggle kernel: runtime → cache → weights → vLLM → tunnel → READY
-notebook/qwen38-tpu-serve.ipynb  the same flow as a run-it-yourself notebook
-patches/mtp-rollback-v0280.diff  GDN state-rollback fix (port of tpu-inference PR #3178)
+../launch.py                     the CLI at the repo root: serve / status / stop / build-weights / build-env, with live progress
+kernel/serve_qwen38.py           the Kaggle kernel: runtime → cache → weights → vLLM → tunnel → READY (source of truth)
+notebook/qwen38-tpu-serve.ipynb  the same flow as a run-it-yourself notebook (generated — refresh with tools/sync_notebook.py, never hand-diverge)
+patches/mtp-rollback-v0290.diff  GDN state-rollback fix (port of tpu-inference PR #3178, re-ported for vllm-tpu 0.29.0)
 tools/embed_patch.py             re-embeds the patch into the kernel script after edits
+../../tools/sync_notebook.py     regenerates notebook cells from kernels (both recipes; --check for CI)
+../../tests/                     pure-function unit tests (no Kaggle/TPU needed)
 ```
 
 Plus two public Kaggle datasets the kernel attaches:
 
 - **`rahim3/qwen3-8-27b-bf16`** — mirror of `Qwen/Qwen3.8-27B` (55.6 GB safetensors).
-  Attaching it skips the HF download entirely.
+  Attaching it skips the HF download entirely. Or attach your own weights
+  dataset (see "Serving your own checkpoint" above) — any compatible
+  Qwen3.8-27B checkpoint, bf16 or FP8.
 - **`rahim3/qwen38-tpu-env-v5e8`** — the JAX/XLA compile cache for the documented
   configs (262k/4 and 131k/16 with images on, plus 262k/4 text-only; all MTP k=3), a
   `cloudflared` binary, and a `manifest.json` recording the build date and versions.
   The kernel pins its `uv` dependency resolution to that build date so the cache keeps
   matching. If the Python or vllm-tpu version ever drifts the cache is ignored and the
-  graphs compile cold — slower, never broken.
+  graphs compile cold — slower, never broken. A custom checkpoint never reuses this
+  cache (different graphs); the kernel says so explicitly instead of slow-mismatching.
 
 ### Where the startup time goes (and went)
+
+> **Stale (0.28.0-era).** The breakdown below predates the 0.29.0
+> re-baseline (and the fail-fast gates, which now abort doomed sessions in
+> seconds instead of minutes). Re-measure on a live TPU.
 
 The first version of this recipe took ~50 min from "Run" to a live URL. Measured now: ~22
 (~12 with `--text-only`, ~6 with `--fast-start`):
@@ -185,32 +230,43 @@ folder in the Kaggle UI (Output tab → New Dataset).
   session doesn't eat your quota.
 - **The endpoint is public** (random cloudflared URL) but protected by the generated
   API key. Treat the URL+key pair like a secret; a new launch gets fresh ones.
-- **Prefix caching is off for now**: vllm-tpu 0.28.0 deliberately disables automatic
-  prefix caching for hybrid linear-attention models on TPU. Upstream merged the fix
-  two days after the 0.28.0 release, so a near-future version bump should enable it.
-  Until then, multi-turn agent sessions re-prefill each turn — at 10k tok/s that's
-  ~5 s for a 50k-token conversation, noticeable but fine.
+  Options: `--cloudflare-hostname` + `--cloudflare-token-secret` serve a stable
+  named tunnel instead of a random URL, and `--api-key-secret` pins a stable API
+  key from a Kaggle Secret. vLLM itself binds `127.0.0.1`; the tunnel is the
+  only public entry. The `cloudflared` binary is pinned by version + sha256 and
+  re-verified before every launch.
+- **Prefix caching is on (as of 0.29.0).** Upstream fixed hybrid-GDN prefix
+  caching (`tpu-inference#3422`), so the server passes `--enable-prefix-caching`.
+  One caveat, by upstream design: the platform force-disables it while
+  speculative decoding is active — so with the default `--mtp 3` you get no
+  prefix hits (no crash, just no reuse); with `--mtp 0`, repeated prefixes
+  (multi-turn agent sessions) skip recompute. Live hit-rate measurement is
+  still pending.
 - **First request after idle** can be a touch slower (scheduler warm-up); throughput
-  numbers above are steady-state.
+  numbers above are steady-state (and 0.28.0-era — see the stale note).
 - **Images work, with a one-time cost per image size.** Qwen3.8 is a vision-language model
   and the endpoint accepts `image_url` content (verified: it reads text and shapes from
   screenshots, with MTP on — that needed one more hunk in our patch, since tpu-inference
-  0.28.0 crashes the engine on image + speculative decoding). tpu-inference compiles the
+  crashes the engine on image + speculative decoding (0.28.0-era wording; the patch
+  is re-ported for 0.29.0). tpu-inference compiles the
   vision encoder per image grid size, so the **first** image at a new resolution takes
   ~1 min and may even time out at the tunnel (HTTP 524) — just retry; every later image
   of that size is instant. Coding agents send screenshots at a consistent size, so this
   is paid once. `--text-only` drops image support and ~8 min of startup.
 - **MTP speculative decoding: on by default, and there's a story.** Qwen3.8 ships a
-  native MTP draft head, but stock vllm-tpu 0.28.0 **corrupts outputs** with it on
+  native MTP draft head, but stock vllm-tpu **corrupts outputs** with it on
   TPU — rejected draft tokens advance the gated-DeltaNet recurrent state and are never
-  rolled back (0/12 greedy prompts matched in our verification, with visible garbage).
+  rolled back (0/12 greedy prompts matched in the original 0.28.0-era verification,
+  with visible garbage).
   The fix exists as a stalled upstream PR
   ([tpu-inference #3178](https://github.com/vllm-project/tpu-inference/pull/3178));
-  this repo bundles a port of it onto 0.28.0
-  ([`patches/mtp-rollback-v0280.diff`](patches/mtp-rollback-v0280.diff)), applied to
-  the installed wheel before serving. With the patch: **12/12 greedy prompts match the
-  non-speculative outputs exactly**, at +34 % decode speed in the A/B test (104 vs 78 tok/s at the time; the shipped config now measures ~130; healthy
-  acceptance profile of 87/66/52 % per draft position). If the patch ever fails to
+  this repo bundles a port of it onto 0.29.0
+  ([`patches/mtp-rollback-v0290.diff`](patches/mtp-rollback-v0290.diff)), applied to
+  the installed wheel before serving. With the 0.28.0-era port: **12/12 greedy prompts
+  matched the non-speculative outputs exactly**, at +34 % decode speed in the A/B test
+  (104 vs 78 tok/s at the time; the shipped config then measured ~130; healthy
+  acceptance profile of 87/66/52 % per draft position). The 0.29.0 re-port needs the
+  same A/B re-verification on a live TPU — pending. If the patch ever fails to
   apply (e.g. a future vllm-tpu version), the script disables MTP automatically rather
   than serve corrupted outputs. `--mtp 0` turns it off; k=4 fails to start.
 - **Harmless log noise.** vLLM prints a few scary-looking lines on every TPU start:
@@ -229,11 +285,16 @@ folder in the Kaggle UI (Output tab → New Dataset).
 - **Every download fails with "name resolution"** at step 1: Internet is off for the session (Session options),
   or the account is not phone-verified yet, which disables it.
 - **The server exits the moment a client connects, with `AttributeError: __delitem__`**: the client used JSON
-  mode / structured outputs while MTP and vLLM's async scheduling are on, a path vllm-tpu 0.28.0 cannot handle.
+  mode / structured outputs while MTP and vLLM's async scheduling are on, a path vllm-tpu 0.29.0 cannot handle
+  (no upstream fix found; kept as a workaround, not assumed fixed).
   Set `"async_scheduling": false` in the config cell (`--no-async-scheduling` from the launcher), or
   `"mtp_tokens": 0`.
+- **Fail-fast stops you early instead of burning quota.** The kernel refuses CPU-only
+  sessions (`tpu-topology`), poisoned TPU env, and offline sessions (`no-internet`)
+  in seconds, before building anything. The notebook's preflight cells check the same
+  things interactively.
 - **Anything else**: the kernel now prints the root cause and the first error block from `vllm.log` when the
-  server dies; paste that into an issue.
+  server dies (current run only — reruns no longer blame the previous run's log); paste that into an issue.
 
 ## Credits
 
