@@ -101,6 +101,11 @@ if CFG["fast_start"]:
 os.environ.pop("TPU_LIBRARY_PATH", None)
 
 _raw = open(RAW_LOG, "a", buffering=1)
+# Byte offset where the CURRENT server run starts writing. vllm.log is
+# append-mode, so a rerun-after-failure would otherwise misattribute the
+# previous run's errors to this one; server_death_report() reads only
+# bytes past this offset (Ref: #8).
+_LOG_START = 0
 
 
 def log(*parts):
@@ -281,6 +286,33 @@ def runtime_ok():
     return False
 
 
+def tpu_topology_ok():
+    """Fail early when Kaggle accepted TPU metadata but provisioned a CPU VM."""
+    probe = (
+        "import json, jax\n"
+        "print(json.dumps([{'platform': d.platform, 'kind': d.device_kind, "
+        "'id': d.id} for d in jax.devices()]))"
+    )
+    # NOTE (Stage C): PR-5 used the venv python (PY) here, which forced the
+    # gate after install_runtime. This port uses sys.executable (the image's
+    # jax, same as tpu_check below) so the gate runs BEFORE the venv build.
+    r = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True,
+                       timeout=180)
+    try:
+        devices = json.loads(r.stdout.strip().splitlines()[-1]) if r.returncode == 0 else []
+    except (IndexError, json.JSONDecodeError):
+        devices = []
+    summary = [f"{d.get('platform')}:{d.get('id')} ({d.get('kind')})" for d in devices]
+    if len(devices) == 8 and all(d.get("platform") == "tpu" for d in devices):
+        log("   TPU topology check OK:", ", ".join(summary))
+        return True
+    detail = (r.stderr or r.stdout)[-800:] if not devices else ", ".join(summary)
+    log("   TPU topology check FAILED:", detail or "no JAX devices reported")
+    log("   Expected 8 TPU devices. In Kaggle, stop this session, open Session options, ")
+    log("   select Accelerator -> TPU VM v5e-8, confirm account verification/quota, then rerun.")
+    return False
+
+
 def install_runtime(built=None):
     """Fresh venv with vllm-tpu pinned. CPU torch (what vllm-tpu's own Docker
     image uses) — the default PyPI torch drags in ~3 GB of CUDA libraries that
@@ -303,6 +335,36 @@ def install_runtime(built=None):
              "--extra-index-url", "https://download.pytorch.org/whl/cpu",
              f"vllm-tpu=={ver}"], "pip")
     return "pip" if rc == 0 else None
+
+
+def sanitize_tpu_env():
+    """Kaggle's image derives TPU_WORKER_HOSTNAMES / TPU_WORKER_ADDRS from its cluster metadata, and when that
+    lookup fails the variables end up holding the lookup's WARNING text instead of addresses — libtpu then refuses
+    to start ("INVALID_ARGUMENT: Error: unexpected worker hostname 'WARNING: could not determine ...'"). A v5e-8
+    on Kaggle is one VM holding all 8 chips, so PJRT never needs these variables at all: remove them outright
+    rather than guess which values are well-formed."""
+    dropped = []
+    for name in ("TPU_WORKER_HOSTNAMES", "TPU_WORKER_ADDRS"):
+        val = os.environ.pop(name, None)
+        if val is not None:
+            dropped.append(f"{name}={val.strip()[:70]!r}")
+    if dropped:
+        log("   removed TPU metadata env vars (a single-VM TPU does not need them, and a broken value stops "
+            "libtpu): " + ", ".join(dropped))
+
+
+def internet_check():
+    """A session without Internet fails every DNS lookup (pip, cloudflared, ntfy) and spends ~10 minutes in pip
+    retries before erroring out. Ask PyPI first (~2 s) so the run stops here with a plain message instead."""
+    try:
+        urllib.request.urlopen("https://pypi.org/simple/pip/", timeout=20).read(1)
+        log("   Internet check OK")
+    except Exception as e:  # noqa: BLE001
+        msg = (f"no Internet from this session ({str(e)[:120]}): Session options -> Internet ON (a phone-verified "
+               "Kaggle account is needed for that), then run again. The pip packages and the tunnel need it.")
+        log("   " + msg)
+        publish("failed", step="no-internet", tail=msg)
+        sys.exit(1)
 
 
 def tpu_check():
@@ -344,9 +406,12 @@ def tpu_check():
 
 def server_death_report(max_lines=60):
     """What killed vLLM, from vllm.log: the root-cause exception line, the first error block and a hint for the
-    causes we have seen. The console tail alone scrolls the cause away. Returns (cause, block, hint)."""
+    causes we have seen. The console tail alone scrolls the cause away. Returns (cause, block, hint).
+    Reads only the current run (past _LOG_START): the log is append-mode, so a rerun would otherwise
+    blame the previous run's errors."""
     try:
-        lines = [l for l in RAW_LOG.read_text(errors="replace").splitlines() if l.startswith("[vllm]")]
+        raw = RAW_LOG.read_bytes()[globals().get("_LOG_START", 0):]
+        lines = [l for l in raw.decode(errors="replace").splitlines() if l.startswith("[vllm]")]
     except Exception:  # noqa: BLE001
         return "", "", ""
     strip = re.compile(r"^\[vllm\] (?:\((?:EngineCore|APIServer|Worker)[^)]*\) )?(?:ERROR|CRITICAL) [\d-]+ [\d:]+ \[[^\]]+\] ?")
@@ -375,8 +440,19 @@ def server_death_report(max_lines=60):
 def server_died(server, phase, **extra):
     """Log why the vLLM server exited (root cause first), publish it, and stop the kernel."""
     cause, block, hint = server_death_report()
+    rc = getattr(server, "returncode", None)
+    if not cause and not hint:
+        if rc == 0:
+            hint = ("clean exit with no error in the log: something outside vLLM stopped it "
+                    "(e.g. Save & Run All / Commit, which kills the session — use an interactive "
+                    "session instead, or check the keepalive loop above)")
+        elif phase == "failed":
+            hint = ("no known cause in this run's log: flaky start or a newer image breaking the "
+                    f"pinned runtime — attach {RAW_LOG} when reporting")
+        else:
+            hint = (f"no known cause in this run's log — attach {RAW_LOG} when reporting")
     tail = "\n".join(list(server.tail)[-40:]) if getattr(server, "tail", None) else ""
-    log(f"server exited rc={server.returncode}" + (f" — root cause: {cause}" if cause else ""))
+    log(f"server exited rc={rc}" + (f" — root cause: {cause}" if cause else ""))
     if hint:
         log(f"   -> {hint}")
     if block:
@@ -385,14 +461,19 @@ def server_died(server, phase, **extra):
         log("--- last output ---\n" + tail)
     log(f"full log: {RAW_LOG}")
     head = (f"root cause: {cause}\n" if cause else "") + (f"{hint}\n" if hint else "")
-    publish(phase, rc=server.returncode, cause=cause, hint=hint,
+    publish(phase, rc=rc, cause=cause, hint=hint,
             tail=(head + "\n" + (block or tail)[-2200:]).strip(), **extra)
     sys.exit(1)
 
 
 # ---------------- 1. runtime ----------------
 banner(1, "Python runtime", f"vllm-tpu {CFG['vllm_tpu_version']}")
+sanitize_tpu_env()
+if not tpu_topology_ok():
+    publish("failed", step="tpu-topology", expected=8)
+    sys.exit(1)
 tpu_check()
+internet_check()
 threading.Thread(target=fetch_cloudflared, daemon=True).start()
 bundle_root = find_input(CFG["env_dataset"].split("/")[-1], "qwen38-tpu-env*")
 bundle, manifest = None, {}
@@ -708,6 +789,12 @@ def launch_server(cfg):
     publish("server-launch", max_model_len=cfg["max_model_len"],
             max_num_seqs=cfg["max_num_seqs"], mtp=cfg["mtp_tokens"],
             text_only=cfg["text_only"], min_token_bucket=cfg["min_token_bucket"])
+    global _LOG_START
+    try:
+        _raw.flush()
+        _LOG_START = RAW_LOG.stat().st_size
+    except Exception:
+        _LOG_START = 0
     tail = collections.deque(maxlen=200)
     p = subprocess.Popen(server_args(cfg), stdout=subprocess.PIPE,
                          stderr=subprocess.STDOUT, text=True, env=os.environ.copy())
