@@ -7,7 +7,19 @@ companion keeps its own `CHANGELOG-0.4.5.txt`.)
 
 ## Unreleased
 
-- Stage D (next): tunnel + supply-chain hardening (see `plans/D-TUNNEL-HARDENING.md`).
+- Stage B2 (next): free-CPU-kernel weights builder (see `plans/B-WEIGHTS-SOURCE.md`).
+- Stage E (next): launcher robustness + single-source sync + CI.
+
+## 2026-09-24 — `63751fd` — Stage D: tunnel + supply-chain hardening
+
+- `cloudflared` 2026.9.1 pinned + independently re-verified sha256,
+  atomic install, pre-exec re-hash, foreground fail-hard (no more
+  unpinned `latest` binary or unhashed dataset copy).
+- vLLM binds `127.0.0.1`; secrets scrubbed from logs/ntfy (ready event
+  carries no key); atomic `0600` launcher state.
+- Opt-in stable named tunnel + stable API key; quick-tunnel default kept.
+- Implement → independent-review → land pipeline: reviewer re-derived
+  the digest and verified the Tauri contract; 32/32 tests green.
 
 ## 2026-09-24 — `0e443be` — Stage C: fail-fast gates + honest diagnostics
 
