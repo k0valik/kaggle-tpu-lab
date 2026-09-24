@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Re-embed patches/mtp-rollback-v0280.diff into kernel/serve_qwen38.py (paths relative to this model folder).
+"""Re-embed patches/mtp-rollback-v0290.diff into kernel/serve_qwen38.py (paths relative to this model folder).
 
 Run after editing the patch file:  python qwen38-27b/tools/embed_patch.py
 """
@@ -9,7 +9,7 @@ import re
 from pathlib import Path
 
 repo = Path(__file__).resolve().parent.parent
-diff = (repo / "patches" / "mtp-rollback-v0280.diff").read_bytes()
+diff = (repo / "patches" / "mtp-rollback-v0290.diff").read_bytes()
 blob = base64.b64encode(gzip.compress(diff, 9)).decode()
 
 script_path = repo / "kernel" / "serve_qwen38.py"

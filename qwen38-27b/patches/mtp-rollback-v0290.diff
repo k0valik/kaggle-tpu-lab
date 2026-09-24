@@ -1,8 +1,7 @@
 diff --git a/tpu_inference/layers/common/attention_metadata.py b/tpu_inference/layers/common/attention_metadata.py
-index 7b1ad95..df04c6c 100644
 --- a/tpu_inference/layers/common/attention_metadata.py
 +++ b/tpu_inference/layers/common/attention_metadata.py
-@@ -55,6 +55,8 @@ class PCPMetadata:
+@@ -55,6 +55,8 @@
          "query_start_loc",
          "request_distribution",
          "mamba_state_indices",
@@ -11,7 +10,7 @@ index 7b1ad95..df04c6c 100644
          "pcp",
      ],
      meta_fields=["padded_num_reqs", "pcp_cache_pages"],
-@@ -80,6 +82,17 @@ class AttentionMetadata(object):
+@@ -80,6 +82,17 @@
      # None for models without mamba layers; pure-mamba models would also
      # use this field, only hybrid models exercise it today.
      mamba_state_indices: jax.Array | None = None
@@ -30,7 +29,6 @@ index 7b1ad95..df04c6c 100644
      # PCP-specific metadata. None when not running prefill context parallelism.
      pcp: PCPMetadata | None = None
 diff --git a/tpu_inference/layers/common/gdn_attention.py b/tpu_inference/layers/common/gdn_attention.py
-index a899bda..ca2bc93 100644
 --- a/tpu_inference/layers/common/gdn_attention.py
 +++ b/tpu_inference/layers/common/gdn_attention.py
 @@ -15,7 +15,6 @@
@@ -41,19 +39,19 @@ index a899bda..ca2bc93 100644
  from typing import Optional, Tuple
  
  import jax
-@@ -47,6 +46,8 @@ def run_jax_gdn_attention(
-     d_v: int,
+@@ -48,6 +47,8 @@
      kernel_size: int,
      mesh: jax.sharding.Mesh,
+     read_state_indices: Optional[jnp.ndarray] = None,
 +    slot_read_offsets: Optional[jnp.ndarray] = None,
 +    num_spec_tokens: int = 0,
  ) -> Tuple[Tuple[jnp.ndarray, jnp.ndarray], jnp.ndarray]:
      """Runs the Jax GDN attention mechanism.
  
-@@ -81,6 +82,11 @@ def run_jax_gdn_attention(
-         kernel_size: Convolution kernel size.
-         mesh: The device mesh for distributed computation.
-         config: Configuration for implementation selection.
+@@ -88,6 +89,11 @@
+           prefix caching passes a different slot here, since a request
+           resumes from the cached state block of the last block boundary and
+           checkpoints into the block covering its current position.
 +        slot_read_offsets: Optional `(num_blocks,)` per-slot mamba read offset
 +          for spec decoding, gathered per request as
 +          `slot_read_offsets[state_indices]`. Required iff `num_spec_tokens > 0`.
@@ -62,9 +60,9 @@ index a899bda..ca2bc93 100644
  
      Returns:
          A tuple containing:
-@@ -108,6 +114,10 @@ def run_jax_gdn_attention(
-         P(ShardingAxisName.ATTN_DATA),  # distribution
+@@ -119,6 +125,10 @@
          P(ShardingAxisName.ATTN_DATA),  # seq_lens
+         P(ShardingAxisName.ATTN_DATA),  # read_state_indices
      )
 +    # slot_read_offsets is an optional operand: when absent it is passed as
 +    # None with a matching None spec (no sharded array).
@@ -73,7 +71,7 @@ index a899bda..ca2bc93 100644
  
      out_specs = (
          (
-@@ -121,14 +131,39 @@ def run_jax_gdn_attention(
+@@ -132,14 +142,40 @@
  
      tp_size = get_mesh_shape_product(mesh, ShardingAxisName.ATTN_HEAD)
  
@@ -90,7 +88,7 @@ index a899bda..ca2bc93 100644
 +                                      j_conv_bias, j_A_log, j_dt_bias,
 +                                      query_start_loc, state_indices,
 +                                      distribution, seq_lens,
-+                                      slot_read_offsets):
++                                      read_state_indices, slot_read_offsets):
 +        read_offsets = None
 +        if slot_read_offsets is not None:
 +            # `state_indices` are rank-local base slots; `slot_read_offsets`
@@ -110,6 +108,7 @@ index a899bda..ca2bc93 100644
 +            state_indices,
 +            distribution,
 +            seq_lens,
++            read_state_indices,
 +            read_offsets,
 +            n_kq=n_kq // tp_size,
 +            n_v=n_v // tp_size,
@@ -121,33 +120,32 @@ index a899bda..ca2bc93 100644
  
      mapped_fn = jax.shard_map(
          p_run_jax_gdn_attention_local,
-@@ -152,6 +187,7 @@ def run_jax_gdn_attention(
-         state_indices,
+@@ -164,6 +200,7 @@
          distribution,
          seq_lens,
+         read_state_indices,
 +        slot_read_offsets,
      )
  
-     return (new_conv_state, new_recurrent_state), output
+     (new_conv_state, new_recurrent_state), output = mapped_fn(*mapped_args)
 diff --git a/tpu_inference/layers/vllm/custom_ops/gdn_attention_op.py b/tpu_inference/layers/vllm/custom_ops/gdn_attention_op.py
-index 1d740e7..4f38abe 100644
 --- a/tpu_inference/layers/vllm/custom_ops/gdn_attention_op.py
 +++ b/tpu_inference/layers/vllm/custom_ops/gdn_attention_op.py
-@@ -68,6 +68,13 @@ def gdn_attention_core_tpu(
-     query_start_loc = first_attn_metadata.query_start_loc
-     seq_lens = first_attn_metadata.seq_lens
-     state_indices = first_attn_metadata.mamba_state_indices
-+    slot_read_offsets = first_attn_metadata.mamba_slot_read_offsets
-+    if first_attn_metadata.mamba_request_distribution is not None:
+@@ -67,6 +67,13 @@
+ 
+     padded_num_reqs = attn_metadata.padded_num_reqs
+     request_distribution = attn_metadata.request_distribution
++    slot_read_offsets = attn_metadata.mamba_slot_read_offsets
++    if attn_metadata.mamba_request_distribution is not None:
 +        # Spec decoding: the GDN windowed segment covers both 1-token
 +        # decodes and speculative verify windows (the batch is ordered
 +        # [decode][verify][prefill/mixed]); RPA keeps using
 +        # `request_distribution` with its 1-token decode front segment.
-+        request_distribution = first_attn_metadata.mamba_request_distribution
- 
-     layer_module = fc.no_compile_layers[layer_name]
-     vllm_context = get_vllm_model_wrapper_context()
-@@ -109,6 +116,20 @@ def gdn_attention_core_tpu(
++        request_distribution = attn_metadata.mamba_request_distribution
+     query_start_loc = attn_metadata.query_start_loc
+     seq_lens = attn_metadata.seq_lens
+     block_tables = attn_metadata.block_tables
+@@ -111,6 +118,20 @@
      else:
          conv_state_in = conv_state
  
@@ -165,23 +163,22 @@ index 1d740e7..4f38abe 100644
 +            f"speculative columns (state_len={state_len}, "
 +            f"kernel_size={kernel_size})")
 +
-     # Index mamba state by the per-request slot id from
-     # `InputBatch.mamba_state_indices_cpu`, not by `block_tables[:, 0]`
-     # (vLLM's GPU convention). Two reasons:
-@@ -156,6 +177,8 @@ def gdn_attention_core_tpu(
-          d_v,
+     padded_num_reqs_per_dp = padded_num_reqs // dp_size
+ 
+     query_start_loc_sliced = truncate_sharded_tensor(
+@@ -185,6 +206,8 @@
           kernel_size,
           mesh=mesh,
+          read_state_indices=read_state_indices_sliced,
 +         slot_read_offsets=slot_read_offsets,
 +         num_spec_tokens=num_spec_tokens,
       )
      if state_len > kernel_size - 1:
          remaining_old_state = conv_state[:, kernel_size - 1:, :]
 diff --git a/tpu_inference/runner/compilation_manager.py b/tpu_inference/runner/compilation_manager.py
-index 3a35d19..6169f1e 100644
 --- a/tpu_inference/runner/compilation_manager.py
 +++ b/tpu_inference/runner/compilation_manager.py
-@@ -442,6 +442,16 @@ class CompilationManager:
+@@ -444,6 +444,16 @@
                                                 sharding=metadata_attn_sharding)
          else:
              mamba_state_indices = None
@@ -198,7 +195,7 @@ index 3a35d19..6169f1e 100644
  
          def build_block_table(kv_cache_gid: int) -> jax.Array:
              block_table_obj = self.runner.input_batch.block_table[kv_cache_gid]
-@@ -462,6 +472,8 @@ class CompilationManager:
+@@ -464,6 +474,8 @@
                  query_start_loc=query_start_loc,
                  request_distribution=request_distribution,
                  mamba_state_indices=mamba_state_indices,
@@ -207,7 +204,7 @@ index 3a35d19..6169f1e 100644
                  padded_num_reqs=num_reqs,
                  pcp=pcp,
              )
-@@ -1248,6 +1260,7 @@ class CompilationManager:
+@@ -1250,6 +1262,7 @@
          self._precompile_process_and_extend_logits()
          self._precompile_extend_logits_simple()
          self._precompile_select_from_array_spec_decode()
@@ -215,7 +212,7 @@ index 3a35d19..6169f1e 100644
          if self.runner.speculative_config.method == "eagle3":
              self._precompile_eagle3_helpers()
          elif self.runner.speculative_config.method == "dflash":
-@@ -1255,6 +1268,31 @@ class CompilationManager:
+@@ -1257,6 +1270,31 @@
          elif self.runner.speculative_config.method == "mtp":
              self._precompile_mtp_helpers()
  
@@ -247,7 +244,7 @@ index 3a35d19..6169f1e 100644
      def _precompile_select_from_array_spec_decode(self) -> None:
          logger.info("Compiling select_from_array with different input shapes.")
          vocab_size = self.runner.vocab_size
-@@ -1493,6 +1531,17 @@ class CompilationManager:
+@@ -1495,6 +1533,17 @@
                  sharding=dp_sharding)
          else:
              eagle3_mamba_state_indices = None
@@ -265,7 +262,7 @@ index 3a35d19..6169f1e 100644
  
          num_reqs_dp = self._create_dummy_tensor((dp_size, ),
                                                  jnp.int32,
-@@ -1510,6 +1559,9 @@ class CompilationManager:
+@@ -1512,6 +1561,9 @@
                      query_start_loc=query_start_loc,
                      request_distribution=request_distribution,
                      mamba_state_indices=eagle3_mamba_state_indices,
@@ -275,7 +272,7 @@ index 3a35d19..6169f1e 100644
                      padded_num_reqs=num_reqs,
                  )
  
-@@ -1629,6 +1681,17 @@ class CompilationManager:
+@@ -1631,6 +1683,17 @@
                                                 sharding=dp_sharding)
          else:
              mamba_state_indices = None
@@ -293,7 +290,7 @@ index 3a35d19..6169f1e 100644
  
          num_reqs_dp = self._create_dummy_tensor((dp_size, ),
                                                  jnp.int32,
-@@ -1654,6 +1717,8 @@ class CompilationManager:
+@@ -1656,6 +1719,8 @@
                      query_start_loc=query_start_loc,
                      request_distribution=request_distribution,
                      mamba_state_indices=mamba_state_indices,
@@ -302,7 +299,7 @@ index 3a35d19..6169f1e 100644
                      padded_num_reqs=num_reqs,
                  )
  
-@@ -1752,6 +1817,14 @@ class CompilationManager:
+@@ -1754,6 +1819,14 @@
                  sharding=dp_sharding)
          else:
              dflash_mamba_state_indices = None
@@ -317,7 +314,7 @@ index 3a35d19..6169f1e 100644
  
          num_reqs_dp = self._create_dummy_tensor((dp_size, ),
                                                  jnp.int32,
-@@ -1788,6 +1861,9 @@ class CompilationManager:
+@@ -1790,6 +1863,9 @@
                      query_start_loc=query_start_loc,
                      request_distribution=request_distribution,
                      mamba_state_indices=dflash_mamba_state_indices,
@@ -327,7 +324,7 @@ index 3a35d19..6169f1e 100644
                      padded_num_reqs=num_reqs,
                  )
  
-@@ -1847,6 +1923,9 @@ class CompilationManager:
+@@ -1849,6 +1925,9 @@
                      query_start_loc=query_start_loc,
                      request_distribution=request_distribution,
                      mamba_state_indices=dflash_mamba_state_indices,
@@ -338,10 +335,9 @@ index 3a35d19..6169f1e 100644
                  )
  
 diff --git a/tpu_inference/runner/persistent_batch_manager.py b/tpu_inference/runner/persistent_batch_manager.py
-index 05e8275..295ee95 100644
 --- a/tpu_inference/runner/persistent_batch_manager.py
 +++ b/tpu_inference/runner/persistent_batch_manager.py
-@@ -41,6 +41,12 @@ class PersistentBatchManager:
+@@ -41,6 +41,12 @@
          (decode_only, fixed_chunked_prefill_only, mixed) and set the request
          distribution accordingly.
  
@@ -354,28 +350,28 @@ index 05e8275..295ee95 100644
          Returns:
              The number of swaps in requests.
          """
-@@ -57,30 +63,47 @@ class PersistentBatchManager:
-                 num_decode, num_decode, num_reqs
+@@ -74,32 +80,46 @@
              ]
              return swap_cnt
+ 
 -        # Use two-pointer approach to reorder the decode requests to front.
 -        i, j = 0, num_reqs - 1
 -        while i < j:
 -            i_req_id = self.input_batch.req_ids[i]
 -            j_req_id = self.input_batch.req_ids[j]
--
--            if scheduler_output.num_scheduled_tokens[i_req_id] == 1:
++        spec_decode_tokens = scheduler_output.scheduled_spec_decode_tokens
+ 
+-            if scheduler_output.num_scheduled_tokens[
+-                    i_req_id] <= max_decode_tokens:
 -                # i is a decode request, move to the next one.
 -                i += 1
--            elif scheduler_output.num_scheduled_tokens[j_req_id] > 1:
+-            elif scheduler_output.num_scheduled_tokens[
+-                    j_req_id] > max_decode_tokens:
 -                # j is a prefill request, move to the previous one.
 -                j -= 1
 -            else:
 -                # Swap i and j.
 -                self.input_batch.swap_states(i, j)
-+
-+        spec_decode_tokens = scheduler_output.scheduled_spec_decode_tokens
-+
 +        def segment(req_id: str) -> int:
 +            # 0: 1-token decode, 1: speculative verify window,
 +            # 2: prefill/mixed.
@@ -408,7 +404,7 @@ index 05e8275..295ee95 100644
 +            return i
  
 -        num_decode = i + int(scheduler_output.num_scheduled_tokens[
--            self.input_batch.req_ids[i]] == 1)
+-            self.input_batch.req_ids[i]] <= max_decode_tokens)
 +        # Pass 1: 1-token decode requests to the front.
 +        num_decode = partition(0, num_reqs - 1, 0)
 +        # Pass 2: speculative verify windows before prefill/mixed requests.
@@ -423,10 +419,9 @@ index 05e8275..295ee95 100644
  
          return swap_cnt
 diff --git a/tpu_inference/runner/tpu_runner.py b/tpu_inference/runner/tpu_runner.py
-index b2e9607..9dead2c 100644
 --- a/tpu_inference/runner/tpu_runner.py
 +++ b/tpu_inference/runner/tpu_runner.py
-@@ -592,6 +592,32 @@ def _subtract_num_rejected_tokens_fn(seq_lens: jax.Array, positions: jax.Array,
+@@ -592,6 +592,32 @@
      return seq_lens, positions
  
  
@@ -459,7 +454,7 @@ index b2e9607..9dead2c 100644
  def _jax_logprobs_materialize(
          logprobs_tensors: LogprobsTensors,
          logits_indices_selector: Optional[List[int]] = None,
-@@ -823,6 +849,12 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
+@@ -823,6 +849,12 @@
          self._init_inputs()
          self._init_speculative_decoding()
  
@@ -472,7 +467,7 @@ index b2e9607..9dead2c 100644
          # Delegate functions to specific manager classes.
          self.compilation_manager = CompilationManager(self)
          if self.is_last_rank:
-@@ -861,6 +893,15 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
+@@ -861,6 +893,15 @@
          # every-step check.
          self.continue_decode_eos_check_interval = (
              envs.CONTINUE_DECODE_EOS_CHECK_INTERVAL)
@@ -488,7 +483,7 @@ index b2e9607..9dead2c 100644
          self.static_max_decode_steps = self.vllm_config.additional_config.get(
              "max_decode_steps", DEFAULT_MAX_DECODE_STEPS)
          self.eos_token_id = runner_utils.get_eos_token_id(self.model_config)
-@@ -1291,6 +1332,24 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
+@@ -1291,6 +1332,24 @@
              self.input_batch.init_mamba_pools(
                  self.kv_cache_manager.actual_mamba_num_blocks)
  
@@ -513,7 +508,7 @@ index b2e9607..9dead2c 100644
          # This buffer grows dynamically to accommodate metadata and block tables.
          # We re-initialize with a precise capacity now that kv_cache_config is known.
          num_kv_groups = len(kv_cache_config.kv_cache_groups)
-@@ -1623,6 +1682,10 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
+@@ -1627,6 +1686,10 @@
          # Later, the multi-modality model will take the embedding as the input.
          # For text-only model, this does nothing. It will input the input_ids and
          # leave the embedding job inside the forward pass
@@ -524,7 +519,7 @@ index b2e9607..9dead2c 100644
          input_ids, inputs_embeds = self._get_input_ids_embeds(
              input_ids, mm_embeds, is_mm_embed)
  
-@@ -1727,7 +1790,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
+@@ -1731,7 +1794,7 @@
              attn_metadata=attn_metadata,
              shared_attn_metadata=shared_attn_metadata,
              sampling_metadata=sampling_metadata,
@@ -533,7 +528,7 @@ index b2e9607..9dead2c 100644
              hidden_states=hidden_states,
              logits=logits,
              aux_hidden_states=aux_hidden_states,
-@@ -2125,11 +2188,23 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
+@@ -2129,11 +2192,23 @@
          spec_decode_num_rejected_tokens = None
          if self.speculative_config:
              with self.maybe_forbid_compile, jax.set_mesh(self.mesh):
@@ -562,27 +557,30 @@ index b2e9607..9dead2c 100644
                  self.speculative_decoding_manager.propose_draft_token_ids(
                      next_tokens,
                      logits_indices_selector,
-@@ -2834,18 +2909,33 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
-         mrope_positions = self.mrope_positions_cpu[:, :
-                                                    padded_total_num_scheduled_tokens]
+@@ -2845,19 +2920,36 @@
+         max_decode_tokens = self.input_batch.max_decode_tokens
+ 
          _request_distribution = []
 +        _mamba_request_distribution = []
          for dp_rank in range(dp_size):
              _num_reqs = num_req_per_dp_rank[dp_rank]
 -            # The batch has been reordered by _reorder_batch so decode requests come first
--            # Count decode requests (those with num_scheduled_tokens == 1) in this DP rank
+-            # Count decode requests (those with num_scheduled_tokens <= max_decode_tokens) in this DP rank
 +            # The batch has been reordered by _reorder_batch into
-+            # [decode][spec verify][prefill/mixed] segments. Count 1-token
-+            # decode requests (the RPA decode segment) and windowed requests
-+            # (decodes + speculative verify windows, the GDN windowed
-+            # segment) in this DP rank.
++            # [decode][spec verify][prefill/mixed] segments. Count decode
++            # requests for RPA (those with num_scheduled_tokens <=
++            # max_decode_tokens, which includes speculative verify windows
++            # when the batched RPA kernel is enabled) and windowed requests
++            # (1-token decodes + speculative verify windows, the GDN
++            # windowed segment) in this DP rank.
              num_decode_in_dp_rank = 0
 +            num_windowed_in_dp_rank = 0
              for req_id in req_ids_dp[dp_rank]:
-                 if scheduler_output.num_scheduled_tokens[req_id] == 1:
+                 if scheduler_output.num_scheduled_tokens[
+                         req_id] <= max_decode_tokens:
                      num_decode_in_dp_rank += 1
-+                    num_windowed_in_dp_rank += 1
-+                elif req_id in scheduler_output.scheduled_spec_decode_tokens:
++                if (scheduler_output.num_scheduled_tokens[req_id] == 1 or
++                        req_id in scheduler_output.scheduled_spec_decode_tokens):
 +                    num_windowed_in_dp_rank += 1
              _request_distribution.append(
                  [num_decode_in_dp_rank, num_decode_in_dp_rank, _num_reqs])
@@ -598,7 +596,7 @@ index b2e9607..9dead2c 100644
  
          # Prefill context parallelism (single request, prefill only): head-tail
          # arrange this request's current tokens into rank order
-@@ -3034,13 +3124,24 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
+@@ -3049,13 +3141,24 @@
                  mamba_state_indices_cpu[req_offset:req_offset +
                                          _num_reqs] = (global_slots %
                                                        local_slots)
@@ -628,7 +626,7 @@ index b2e9607..9dead2c 100644
              (request_distribution, dev_arrays_payload) = device_array(
                  self.mesh, (request_distribution, metadata_blob),
                  sharding=metadata_attn_sharding)
-@@ -3067,6 +3168,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
+@@ -3082,6 +3185,8 @@
                  query_start_loc=query_start_loc,
                  request_distribution=request_distribution,
                  mamba_state_indices=mamba_state_indices,
@@ -638,10 +636,9 @@ index b2e9607..9dead2c 100644
                  pcp=pcp_metadata,
              )
 diff --git a/tpu_inference/spec_decode/jax/utils.py b/tpu_inference/spec_decode/jax/utils.py
-index 1fe3c50..8c1ebfb 100644
 --- a/tpu_inference/spec_decode/jax/utils.py
 +++ b/tpu_inference/spec_decode/jax/utils.py
-@@ -32,8 +32,8 @@ PLACEHOLDER_TOKEN_ID = -1
+@@ -32,8 +32,8 @@
  def extract_last_sampled_tokens(
          spec_decode_metadata: SpecDecodeMetadata,
          sampled_token_ids: jnp.ndarray, num_speculative_tokens: int,
@@ -652,7 +649,7 @@ index 1fe3c50..8c1ebfb 100644
  
      def _body(draft_lengths, sampled_token_ids):
          return _extract_last_sampled_tokens(draft_lengths, sampled_token_ids,
-@@ -45,7 +45,7 @@ def extract_last_sampled_tokens(
+@@ -45,7 +45,7 @@
          _body,
          mesh=mesh,
          in_specs=(data_spec, data_spec),
@@ -661,7 +658,7 @@ index 1fe3c50..8c1ebfb 100644
      )(spec_decode_metadata.draft_lengths, sampled_token_ids)
  
  
-@@ -54,8 +54,9 @@ def extract_last_sampled_tokens(
+@@ -54,8 +54,9 @@
  def _extract_last_sampled_tokens(
          draft_lengths: jnp.ndarray, sampled_token_ids: jnp.ndarray,
          num_speculative_tokens: int, vocab_size: int,
@@ -673,7 +670,7 @@ index 1fe3c50..8c1ebfb 100644
      # `sampled_token_ids` is the output of the rejection sampler.
      num_draft_tokens = draft_lengths
      batch_size = num_draft_tokens.shape[0]
-@@ -93,7 +94,14 @@ def _extract_last_sampled_tokens(
+@@ -93,7 +94,14 @@
      num_rejected_tokens = jnp.pad(num_rejected_per_seq,
                                    (0, max_num_seq - batch_size),
                                    constant_values=0)

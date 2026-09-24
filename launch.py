@@ -442,7 +442,7 @@ def main():
                    help="show every vLLM log line in the kernel log")
     s.add_argument("--no-async-scheduling", action="store_true",
                    help="qwen38-27b: pass --no-async-scheduling to vLLM. Needed when clients use JSON mode / "
-                        "structured outputs with MTP on (vllm-tpu 0.28.0 otherwise exits with AttributeError: "
+                        "structured outputs with MTP on (vllm-tpu 0.29.0 otherwise exits with AttributeError: "
                         "__delitem__); costs some throughput")
     s.add_argument("--fast-start", action="store_true",
                    help="skip TPU graph precompile: endpoint live in ~4 min (with the env "
