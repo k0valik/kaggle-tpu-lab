@@ -7,7 +7,18 @@ companion keeps its own `CHANGELOG-0.4.5.txt`.)
 
 ## Unreleased
 
-- Stage C (next): fail-fast + honest diagnostics (see `plans/C-FAILFAST-DIAGNOSTICS.md`).
+- Stage D (next): tunnel + supply-chain hardening (see `plans/D-TUNNEL-HARDENING.md`).
+
+## 2026-09-24 — `0e443be` — Stage C: fail-fast gates + honest diagnostics
+
+- Kernel dies in seconds (not after 20 doomed minutes) on CPU-only,
+  poisoned-env, or offline sessions: env sanitize → topology gate →
+  internet check, all before venv build / downloads.
+- Append-mode `vllm.log` no longer misattributes old runs (`_LOG_START`
+  offset); `server_died()` distinguishes startup crash vs external
+  stop with actionable hints.
+- Notebook gains TPU + dataset/scratch preflight cells and a
+  troubleshooting table; `tests/test_failfast.py` (7 tests) green.
 
 ## 2026-09-24 — `f4c7b56` — Stage B: generic Qwen3.8-27B weights source
 
