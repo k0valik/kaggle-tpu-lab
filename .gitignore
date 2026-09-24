@@ -9,3 +9,9 @@ src-tauri/target/
 .maestri/
 .commandcode/
 kaggle.json
+work/
+.venv/
+serve_config.json
+inference-key.json
+.kaggle-tpu-lab.json
+bundle/

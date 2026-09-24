@@ -51,6 +51,23 @@ third-party checkpoint.
    `*.jinja` support. Skip if it bloats the stage; can split to B2.
 8. Regenerate the Qwen notebook cell from the edited kernel.
 
+## B2 — free-CPU-kernel weights builder (ADOPTED from PR #3)
+
+The trick: TPU quota (~20 h/week) is the scarce resource; CPU kernels are
+separate/free. Instead of downloading a 55 GB checkpoint on the TPU run
+(burning TPU hours on download + cold compile), push a small CPU kernel
+that `snapshot_download`s the checkpoint to `/kaggle/working/weights`,
+then create a Kaggle dataset from its output in the UI and attach that
+dataset to the TPU run. (If the owner holds the quant locally, they can
+create the dataset from local files directly — the CPU trick is for
+HF-hosted checkpoints, incl. gated ones.)
+
+Implement CLI-first: `launch.py build-weights --hf-model-id X --slug Y`
+(pushes a CPU script kernel templated with the repo ID + `*.jinja`
+patterns + token support, waits, prints "create dataset from output"
+instructions). No TPU flag, no new dependencies. Notebook equivalent
+optional — owner works from the terminal. Docs land in Stage F.
+
 ## PRs consulted (double-pass)
 
 - [#2](https://github.com/k0valik/kaggle-tpu-lab/pull/2) (chynggi, finetunes):
@@ -64,8 +81,7 @@ third-party checkpoint.
   empty dir). IGNORED `launch_fp8.py` wrapper, sentinels, FP8 docs.
 - [#3](https://github.com/k0valik/kaggle-tpu-lab/pull/3) (xiaotian1171):
   LIFTED generic `find_input()` fallbacks. IGNORED Huihui defaults/docs.
-  OPEN: parameterized `build-weights` flow (split to later — double-pass
-  must decide: implement or drop).
+  ADOPTED as B2: the free-CPU-kernel weights-builder trick (see below).
 - [#9](https://github.com/k0valik/kaggle-tpu-lab/pull/9) (KiVixx):
   LIFTED `optional_dataset()`, `HfApi` preflight, `HF_HUB_DISABLE_XET`,
   validation + progress (log-lines-only chosen over the progress thread).

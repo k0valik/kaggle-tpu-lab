@@ -15,6 +15,7 @@ import argparse
 import base64
 import io
 import json
+import os
 import re
 import secrets
 import shutil
@@ -72,14 +73,51 @@ PHASE_TEXT = {
 }
 
 
-def kaggle(*args, capture=True):
-    cmd = [sys.executable, "-m", "kaggle", *args]
-    r = subprocess.run(cmd, capture_output=capture, text=True)
+def kaggle(*args, capture=True, input=None):
+    exe = shutil.which("kaggle")  # prefer the on-PATH console script ...
+    cmd = [exe, *args] if exe else [sys.executable, "-m", "kaggle", *args]  # ... else the module
+    r = subprocess.run(cmd, capture_output=capture, text=True, input=input)
     return r
 
 
 def say(msg):
     print(time.strftime("[%H:%M] "), msg, flush=True)
+
+
+def write_state(state):
+    """Atomically replace the state file with owner-only (0600) perms.
+
+    The state holds the API key, so: temp file in the same directory (mkstemp
+    is 0600 regardless of umask) -> explicit chmod -> fsync -> atomic replace.
+    """
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".ktl-state-", dir=str(STATE_FILE.parent))
+    try:
+        with os.fdopen(fd, "w") as out:
+            json.dump(state, out)
+            out.flush()
+            os.fsync(out.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, STATE_FILE)
+    finally:
+        try:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def api_key_hint(state):
+    """What the ready banner shows for the key: the local copy, or where to find it.
+
+    The ntfy `ready` event carries no key (Stage D secret hygiene), so the
+    launcher must render it from local state — never from the event payload.
+    """
+    if state.get("api_key"):
+        return state["api_key"]
+    if state.get("api_key_secret"):
+        return f"(Kaggle Secret: {state['api_key_secret']})"
+    return "(see the private Kaggle session output)"
 
 
 def check_auth():
@@ -135,9 +173,17 @@ def cmd_serve(args):
 
     if args.model == "qwen38-27b":
         weights_dataset = optional_dataset(args.weights_dataset)
+        # Stable-key option: --api-key-secret NAME leaves api_key empty and lets the
+        # kernel read the Kaggle Secret at runtime; KTL_API_KEY embeds a caller key.
+        api_key_secret = (args.api_key_secret or "").strip()
+        if api_key_secret:
+            api_key = ""
+        elif os.environ.get("KTL_API_KEY", "").strip():
+            api_key = os.environ["KTL_API_KEY"].strip()
         cfg = {
             "ntfy_topic": topic,
             "api_key": api_key,
+            "api_key_secret": api_key_secret,
             "max_model_len": args.max_model_len,
             "max_num_seqs": args.max_num_seqs,
             "mtp_tokens": args.mtp,
@@ -146,6 +192,9 @@ def cmd_serve(args):
             "weights_dataset": weights_dataset,
             "hf_model_id": args.hf_model_id,
             "served_model_name": args.served_model_name,
+            "cloudflare_hostname": (args.cloudflare_hostname or "").strip(),
+            "cloudflare_token_secret": (args.cloudflare_token_secret or "").strip(),
+            "cloudflare_protocol": (args.cloudflare_protocol or "auto").strip(),
         }
         if args.no_tools:
             cfg["tool_call_parser"] = ""
@@ -211,23 +260,25 @@ def cmd_serve(args):
                 say(f"WARNING: {line.strip()} — the kernel will still run, "
                     "but may need to download weights / compile cold.")
 
-    STATE_FILE.write_text(json.dumps(
-        {"kernel": f"{user}/{slug}", "topic": topic, "api_key": api_key,
-         "model": args.model, "submitted_at": int(time.time()),
-         "keepalive_min": args.keepalive_min}))
+    state = {"kernel": f"{user}/{slug}", "topic": topic, "api_key": api_key,
+             "model": args.model, "submitted_at": int(time.time()),
+             "keepalive_min": args.keepalive_min}
+    if args.model == "qwen38-27b" and (args.api_key_secret or "").strip():
+        state["api_key_secret"] = (args.api_key_secret or "").strip()
+    write_state(state)
     say(f"Pushed. Kernel page: https://www.kaggle.com/code/{user}/{slug}")
     say("Kaggle takes a few minutes to provision the TPU and attach the "
         f"datasets; the endpoint is usually live ~{model['minutes']} min after the kernel starts.")
     say("Watching progress (Ctrl-C is safe — the server keeps running; "
         "`python launch.py status` re-attaches, `... stop` kills it).")
-    watch(f"{user}/{slug}", topic)
+    watch(f"{user}/{slug}", topic, api_key=api_key_hint(state))
 
 
 def read_events(topic, since):
     try:
         with urllib.request.urlopen(
                 f"https://ntfy.sh/{topic}/json?poll=1&since={since}", timeout=15) as r:
-            body = r.read().decode()
+            body = r.read(1024 * 1024).decode()  # read cap: ntfy is progress transport, not a log sink
     except Exception:
         return []
     events = []
@@ -245,7 +296,10 @@ def read_events(topic, since):
     return events
 
 
-def render_event(ev):
+def render_event(ev, api_key=None):
+    """Render one kernel progress event. The ready banner shows the API key from
+    local launcher state (api_key arg), never from the ntfy payload — the kernel
+    no longer publishes the key (Stage D secret hygiene)."""
     phase = ev.get("phase", "?")
     if phase == "compiling":
         if "what" in ev:
@@ -265,6 +319,9 @@ def render_event(ev):
                 "compile cold (add ~10 min).")
     elif phase == "tunnel-url":
         say(f"Endpoint URL reserved: {ev.get('endpoint')}  (not live yet — wait for the banner)")
+    elif phase == "tunnel-reconnecting":
+        say(f"Tunnel reconnecting over {ev.get('protocol', '?')} in {ev.get('retry_secs', '?')} s "
+            f"— {ev.get('endpoint', '')} keeps working after reconnect.")
     elif phase == "serving":
         say(f"Server is HEALTHY after {ev.get('startup_secs', 0) // 60} min.")
     elif phase == "benchmark":
@@ -277,7 +334,7 @@ def render_event(ev):
         print("\n" + "=" * 66)
         print("  YOUR ENDPOINT IS LIVE")
         print(f"  base URL : {ev['endpoint']}")
-        print(f"  API key  : {ev['api_key']}")
+        print(f"  API key  : {api_key or ev.get('api_key', '(see the private Kaggle session output)')}")
         print(f"  model    : {ev['model']}   (context: {ev.get('max_model_len', '?')})")
         print("=" * 66)
         base = ev["endpoint"] if ev["endpoint"].endswith("/v1") else ev["endpoint"] + "/v1"
@@ -322,7 +379,7 @@ See the model folder's README for hooking this into Claude Code, Codex CLI, open
         say(text if text else f"{phase} {json.dumps({k: v for k, v in ev.items() if k != 'phase'})}")
 
 
-def watch(kernel, topic):
+def watch(kernel, topic, api_key=None):
     since = int(time.time()) - 600
     last_status = None
     seen_boot = False
@@ -331,7 +388,7 @@ def watch(kernel, topic):
             for ts, ev in read_events(topic, since):
                 since = max(since, ts)
                 seen_boot = True
-                render_event(ev)
+                render_event(ev, api_key=api_key)
                 if ev.get("phase") in ("failed", "auto-shutdown", "stopped"):
                     return
             since = max(since, int(time.time()) - 1) if seen_boot else since
@@ -392,8 +449,8 @@ def cmd_build_env(args):
         out = (r.stdout or "") + (r.stderr or "")
         if r.returncode != 0 or "successfully pushed" not in out.lower():
             sys.exit(f"Push failed:\n{out.strip()}")
-    STATE_FILE.write_text(json.dumps({"kernel": f"{user}/{args.slug}", "topic": topic,
-                                      "api_key": "", "submitted_at": int(time.time())}))
+    write_state({"kernel": f"{user}/{args.slug}", "topic": topic,
+                 "api_key": "", "submitted_at": int(time.time())})
     say(f"Pushed {user}/{args.slug}. It serves each config once (~1.5 h total) and "
         "leaves xla_cache.tar / cloudflared / manifest.json in its output.")
     watch(f"{user}/{args.slug}", topic)
@@ -412,18 +469,17 @@ def cmd_status(args):
     say(((r.stdout or "") + (r.stderr or "")).strip())
     events = read_events(st["topic"], int(time.time()) - 24 * 3600)
     for _, ev in events[-8:]:
-        render_event(ev)
+        render_event(ev, api_key=api_key_hint(st))
     if any(ev.get("phase") == "ready" for _, ev in events):
-        say(f"API key: {st['api_key']}")
+        say(f"API key: {api_key_hint(st)}")
     if args.follow:
-        watch(st["kernel"], st["topic"])
+        watch(st["kernel"], st["topic"], api_key=api_key_hint(st))
 
 
 def cmd_stop(args):
     st = load_state()
     say(f"Deleting kernel {st['kernel']} (terminates the TPU session)...")
-    p = subprocess.run([sys.executable, "-m", "kaggle", "kernels", "delete",
-                        st["kernel"]], input="yes\n", capture_output=True, text=True)
+    p = kaggle("kernels", "delete", st["kernel"], input="yes\n")
     out = (p.stdout + p.stderr).strip()
     say(out or "done")
     if p.returncode != 0:
@@ -469,6 +525,20 @@ def main():
                           "is mounted (i.e. --weights-dataset none)")
     s.add_argument("--served-model-name", default="qwen3.8-27b",
                      help="qwen38-27b: model name advertised by the OpenAI-compatible API")
+    s.add_argument("--cloudflare-hostname", default="",
+                     help="qwen38-27b: fixed hostname of a Cloudflare named tunnel "
+                          "(e.g. llm.example.com). Empty (default) = random quick tunnel. "
+                          "The tunnel token is read inside Kaggle from --cloudflare-token-secret.")
+    s.add_argument("--cloudflare-token-secret", default="CF_TUNNEL_TOKEN",
+                     help="qwen38-27b: Kaggle Secret label holding the named-tunnel token "
+                          "(only used with --cloudflare-hostname; never passed on argv)")
+    s.add_argument("--cloudflare-protocol", default="auto", choices=["auto", "http2", "quic"],
+                     help="qwen38-27b: first transport for a named tunnel; the kernel "
+                          "alternates auto<->http2 on disconnects")
+    s.add_argument("--api-key-secret", default="",
+                     help="qwen38-27b: Kaggle Secret label holding a stable endpoint API key. "
+                          "Empty (default) = the launcher generates a fresh key (or uses "
+                          "KTL_API_KEY from the environment).")
     s.add_argument("--no-tools", action="store_true",
                    help="disable tool-calling support")
     s.add_argument("--text-only", action="store_true",

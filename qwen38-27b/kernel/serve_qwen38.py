@@ -21,6 +21,8 @@ text_only, ~6 with fast_start). Without the env dataset the compile is cold (+15
 """
 import base64
 import collections
+import hashlib
+import hmac
 import struct
 import zlib
 import glob
@@ -33,6 +35,7 @@ import secrets
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.request
@@ -67,8 +70,13 @@ DEFAULTS = {
                                    # request shapes itself; rare shapes stall once (~1 min)
     "keepalive_min": 480,          # auto-shutdown guard (Kaggle TPU caps at 9h anyway)
     "api_key": "",                 # generated if empty
+    "api_key_secret": "",          # Kaggle Secret label holding a stable API key (value read
+                                   # at runtime, never logged/published; see kaggle_secret())
     "ntfy_topic": "",              # optional: publish progress to ntfy.sh/<topic>
     "served_model_name": "qwen3.8-27b",
+    "cloudflare_hostname": "",     # named-tunnel hostname, e.g. llm.example.com ("" = random quick tunnel)
+    "cloudflare_token_secret": "CF_TUNNEL_TOKEN",  # Kaggle Secret label for the tunnel token (never argv)
+    "cloudflare_protocol": "auto",  # auto | http2 | quic; the watcher alternates auto<->http2 on drops
     "verbose": False,              # show every vLLM log line (always saved to vllm.log)
     "build_bundle": False,         # maintainer mode: build the env dataset instead of serving
 }
@@ -77,8 +85,74 @@ CFG = {**DEFAULTS, **(CFG or {})}
 _cfg_file = Path("serve_config.json")
 if _cfg_file.exists():
     CFG.update(json.loads(_cfg_file.read_text()))
+
+
+def verify_sha256(path, expected_hex):
+    """True iff the file at *path* hashes to *expected_hex* (constant-time compare).
+
+    Pure logic (no logging, no network): unit-tested against good/tampered bytes.
+    """
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return hmac.compare_digest(h.hexdigest(), expected_hex.strip().lower())
+
+
+def kaggle_secret(label):
+    """Read a Kaggle Secret by *label* without copying it into CFG, logs, or ntfy.
+
+    Stage B `hf_token()` pattern: best-effort, never raises, and the caller must
+    never log the value (only the label). Returns "" when unavailable.
+    """
+    label = (label or "").strip()
+    if not label:
+        return ""
+    try:
+        from kaggle_secrets import UserSecretsClient
+        return (UserSecretsClient().get_secret(label) or "").strip()
+    except Exception:
+        return ""
+
+
+def redact(text):
+    """Scrub secrets from log/shell/pump-adjacent paths before they hit stdout/vllm.log.
+
+    Covers the literal api_key + tunnel token (exact replace) plus generic shapes
+    (sk-… keys, Bearer headers, token=… assignments) so a secret that arrives via
+    an unexpected path is still caught. Not a general PII scrubber.
+    """
+    text = str(text)
+    seen = []
+    try:
+        if CFG.get("api_key"):
+            seen.append(CFG["api_key"])
+    except Exception:
+        pass
+    token = globals().get("_TUNNEL_TOKEN", "")
+    if token:
+        seen.append(token)
+    try:
+        ht = hf_token()
+        if ht:
+            seen.append(ht)
+    except Exception:
+        pass
+    for s in seen:
+        if s:
+            text = text.replace(s, "[REDACTED]")
+    text = re.sub(r"sk-[A-Za-z0-9]{16,}", "[REDACTED]", text)
+    text = re.sub(r"(?i)(bearer\s+)[^\s\"']+", r"\1[REDACTED]", text)
+    text = re.sub(r"(?i)(?<![A-Za-z_.-])(token\s*[:=]\s*)[^\s\"']+", r"\1[REDACTED]", text)
+    return text
+
+
+if not CFG["api_key"] and CFG.get("api_key_secret"):
+    # Stable-key option: only the secret *label* travels in CFG; the value is read
+    # inside Kaggle at runtime and never touches logs, ntfy, or disk.
+    CFG["api_key"] = kaggle_secret(CFG["api_key_secret"])
 if not CFG["api_key"]:
-    CFG["api_key"] = "sk-" + secrets.token_hex(16)
+    CFG["api_key"] = os.environ.get("KTL_API_KEY", "").strip() or "sk-" + secrets.token_hex(16)
 
 PORT = 8000
 VENV = "/tmp/venv"
@@ -86,7 +160,23 @@ PY = f"{VENV}/bin/python"
 XLA_CACHE = "/tmp/xla_cache"
 WORK = Path("/kaggle/working") if Path("/kaggle/working").is_dir() else Path("/tmp")
 RAW_LOG = WORK / "vllm.log"          # every line vLLM/pip print, for debugging
+# Pinned cloudflared (Stage D tunnel hardening). Re-pin version + digest together
+# from the official release page: https://github.com/cloudflare/cloudflared/releases
+#   version : 2026.9.1  (current stable per the official GitHub releases API)
+#   sha256  : 03f1f25d1cc93b9ad6c60569d44060bc4f17ed97075760ed8cfca4b12dcd68cc  (cloudflared-linux-amd64)
+#   source  : https://github.com/cloudflare/cloudflared/releases/download/2026.9.1/cloudflared-linux-amd64
+#   verified: 2026-09-24 (downloaded the release asset locally and sha256summed it twice)
+# Fail-hard rationale: Stage C's internet_check already aborts offline sessions fast,
+# so a failed tunnel-binary fetch aborts too — a silent fallback to an unhashed
+# dataset binary would trade a loud, diagnosable error for silent supply-chain risk.
+CLOUDFLARED_VERSION = "2026.9.1"
+CLOUDFLARED_SHA256 = "03f1f25d1cc93b9ad6c60569d44060bc4f17ed97075760ed8cfca4b12dcd68cc"
+CLOUDFLARED_URL = (
+    "https://github.com/cloudflare/cloudflared/releases/download/"
+    f"{CLOUDFLARED_VERSION}/cloudflared-linux-amd64"
+)
 CLOUDFLARED = Path("/tmp/cloudflared")
+_TUNNEL_TOKEN = ""  # runtime tunnel token: redact() scrubs it; never in CFG/logs/ntfy/argv
 T0 = time.time()
 PY_VER = f"{sys.version_info.major}.{sys.version_info.minor}"
 
@@ -109,7 +199,7 @@ _LOG_START = 0
 
 
 def log(*parts):
-    line = time.strftime("[%H:%M:%S] ") + " ".join(str(p) for p in parts)
+    line = redact(time.strftime("[%H:%M:%S] ") + " ".join(str(p) for p in parts))
     print(line, flush=True)
     _raw.write(line + "\n")
 
@@ -126,7 +216,13 @@ def banner(step, title, note=""):
 
 
 def publish(phase, **extra):
-    """Progress event: always logged; also pushed to ntfy if a topic is set."""
+    """Progress event: always logged; also pushed to ntfy if a topic is set.
+
+    The api_key never leaves the kernel: it is dropped here even if a caller
+    passes it, so the ntfy payload only carries endpoint/model metadata. The
+    launcher renders the key from its local state file instead.
+    """
+    extra = {k: v for k, v in extra.items() if k != "api_key"}
     log(f"PHASE {phase}", json.dumps(extra) if extra else "")
     if not CFG["ntfy_topic"]:
         return
@@ -148,7 +244,7 @@ def sh(cmd, tag, show=None, env=None):
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                          text=True, env=env)
     for line in p.stdout:
-        line = line.rstrip()
+        line = redact(line.rstrip())
         if not line:
             continue
         tail.append(line)
@@ -238,16 +334,82 @@ def chat_template(model_dir):
     return None
 
 
-def fetch_cloudflared():
-    if CLOUDFLARED.exists():
-        return
+def _install_verified_binary(src, dest):
+    """Atomically install an already digest-verified binary with 0755 perms."""
+    dest = Path(dest)
+    fd, tmp = tempfile.mkstemp(prefix=".cloudflared-", dir=str(dest.parent))
     try:
-        urllib.request.urlretrieve(
-            "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64",
-            CLOUDFLARED)
-        CLOUDFLARED.chmod(0o755)
-    except Exception as e:
-        log(f"(cloudflared download failed: {e})")
+        with os.fdopen(fd, "wb") as out, open(src, "rb") as inp:
+            shutil.copyfileobj(inp, out)
+            out.flush()
+            os.fsync(out.fileno())
+        os.chmod(tmp, 0o755)
+        os.replace(tmp, dest)
+    finally:
+        try:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def fetch_cloudflared():
+    """Foreground pinned fetch of the tunnel binary (Stage D).
+
+    Download-to-temp -> sha256 verify against the pin -> chmod 0755 -> atomic
+    replace, then a post-install re-hash. A dataset-bundled copy is reused only
+    when its digest matches the pin. Anything else (unhashed copy, `latest`
+    URL, mismatch, network error) raises, and the caller aborts the run with a
+    loud error instead of executing an unverified binary. Fail-hard is
+    consistent with Stage C: internet_check already aborts offline sessions, so
+    there is no quiet offline path worth preserving here.
+    """
+    dest = Path(CLOUDFLARED)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dataset_copy = None
+    try:
+        b = globals().get("bundle")
+        if b:
+            cand = Path(b) / "cloudflared"
+            if cand.is_file():
+                dataset_copy = cand
+    except Exception:
+        dataset_copy = None
+    if dataset_copy is not None:
+        try:
+            if verify_sha256(dataset_copy, CLOUDFLARED_SHA256):
+                log("   using dataset cloudflared copy (digest matches the pin)")
+                _install_verified_binary(dataset_copy, dest)
+                return
+            log("   dataset cloudflared copy does not match the pin -> fresh download")
+        except Exception as e:
+            log(f"   dataset cloudflared copy unusable ({e}) -> fresh download")
+    fd, tmp = tempfile.mkstemp(prefix=".cloudflared-", dir=str(dest.parent))
+    try:
+        digest = hashlib.sha256()
+        with os.fdopen(fd, "wb") as out:
+            with urllib.request.urlopen(CLOUDFLARED_URL, timeout=60) as response:
+                while True:
+                    chunk = response.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+                    out.write(chunk)
+            if not hmac.compare_digest(digest.hexdigest(), CLOUDFLARED_SHA256):
+                raise RuntimeError("cloudflared SHA-256 mismatch; refusing to execute")
+            out.flush()
+            os.fsync(out.fileno())
+        os.chmod(tmp, 0o755)
+        os.replace(tmp, dest)
+    finally:
+        try:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+        except OSError:
+            pass
+    if not verify_sha256(dest, CLOUDFLARED_SHA256):
+        raise RuntimeError("cloudflared changed during install; refusing to execute")
+    log("   verified official cloudflared", CLOUDFLARED_VERSION)
 
 
 # gzip+base64 of patches/mtp-rollback-v0290.diff; regenerated by tools/embed_patch.py
@@ -266,8 +428,8 @@ def apply_mtp_patch():
         text=True).strip()
     pkg_root = os.path.dirname(os.path.dirname(origin))
     p = subprocess.run(["patch", "-p1", "-d", pkg_root, "-i", "/tmp/mtpfix.diff",
-                        "--no-backup-if-mismatch", "-N"], capture_output=True, text=True)
-    _raw.write(p.stdout + p.stderr)
+                          "--no-backup-if-mismatch", "-N"], capture_output=True, text=True)
+    _raw.write(redact(p.stdout + p.stderr))
     if p.returncode == 0 or "previously applied" in p.stdout:
         return True
     log(p.stdout[-1500:], p.stderr[-500:])
@@ -474,7 +636,6 @@ if not tpu_topology_ok():
     sys.exit(1)
 tpu_check()
 internet_check()
-threading.Thread(target=fetch_cloudflared, daemon=True).start()
 bundle_root = find_input(CFG["env_dataset"].split("/")[-1], "qwen38-tpu-env*")
 bundle, manifest = None, {}
 if bundle_root:
@@ -485,9 +646,6 @@ if bundle_root:
         manifest = json.loads(Path(hits[0]).read_text())
     else:
         bundle = bundle_root
-if bundle and Path(bundle, "cloudflared").exists() and not CLOUDFLARED.exists():
-    shutil.copy(Path(bundle, "cloudflared"), CLOUDFLARED)
-    CLOUDFLARED.chmod(0o755)
 if manifest and (manifest.get("python") != PY_VER
                  or manifest.get("vllm_tpu_version") != CFG["vllm_tpu_version"]):
     log(f"   env dataset was built for python {manifest.get('python')} / vllm-tpu "
@@ -496,6 +654,13 @@ if manifest and (manifest.get("python") != PY_VER
     manifest = {}
 if not bundle:
     log(f"   env dataset not attached (expected {CFG['env_dataset']}) -> cold compile later")
+# Foreground pinned fetch with a fail-fast message: the tunnel binary is verified
+# before spending time on the install/compile, and a failure aborts here loudly.
+try:
+    fetch_cloudflared()
+except Exception as e:
+    publish("failed", step="tunnel-binary", tail=f"cloudflared fetch failed: {e}")
+    sys.exit(1)
 
 t = time.time()
 publish("install", vllm_tpu=CFG["vllm_tpu_version"])
@@ -674,6 +839,7 @@ def server_args(cfg):
             "--tensor-parallel-size", "8",
             "--max-model-len", str(cfg["max_model_len"]),
             "--max-num-seqs", str(cfg["max_num_seqs"]),
+            "--host", "127.0.0.1",  # loopback only; the cloudflared tunnel is the public entry
             "--port", str(PORT),
             "--api-key", cfg["api_key"],
             "--served-model-name", cfg["served_model_name"],
@@ -802,7 +968,7 @@ def launch_server(cfg):
 
     def pump():
         for line in p.stdout:
-            line = line.rstrip()
+            line = redact(line.rstrip())
             if line:
                 tail.append(line)
                 _raw.write(f"[vllm] {line}\n")
@@ -1067,27 +1233,97 @@ server = launch_server(CFG)
 
 # ---------------- 5. tunnel (in parallel with the server start) ----------------
 banner(5, "Public URL")
+# Pre-exec re-hash: the binary must still match the pin after everything above.
+# Fail here (stopping the server) rather than executing a swapped binary.
+if not verify_sha256(CLOUDFLARED, CLOUDFLARED_SHA256):
+    stop_server(server)
+    publish("failed", step="tunnel", tail="cloudflared changed after verification; refusing to execute")
+    sys.exit(1)
 url = None
 tunnel = None
-for _ in range(60):  # cloudflared download runs in the background from step 1
-    if CLOUDFLARED.exists():
-        break
-    time.sleep(2)
-if CLOUDFLARED.exists():
-    tunnel = subprocess.Popen([str(CLOUDFLARED), "tunnel", "--url", f"http://127.0.0.1:{PORT}",
-                               "--no-autoupdate", "--protocol", "quic"],
-                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    pat = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com")
-    lines = []
+cf_hostname = ((CFG.get("cloudflare_hostname") or "").strip().lower()
+               .removeprefix("https://").rstrip("/"))
+cf_token = kaggle_secret(CFG.get("cloudflare_token_secret")) if cf_hostname else ""
+if cf_hostname and not cf_token:
+    # Fail open with a loud log (PR #9 behavior): a random quick tunnel still
+    # serves; the operator sees why the stable hostname did not apply.
+    log(f"   named tunnel disabled: Kaggle Secret {CFG.get('cloudflare_token_secret')!r} "
+        "is unavailable -> falling back to a random quick tunnel")
+    cf_hostname = ""
+_TUNNEL_TOKEN = cf_token  # redact() scrubs it from every managed log path below
+cf_lines = []
+cf_lock = threading.Lock()
+reported_tunnel_pids = set()
+tunnel_protocol = "auto"
 
-    def pump_cf():
-        for line in tunnel.stdout:
-            lines.append(line.rstrip())
-            _raw.write(f"[cloudflared] {line}")
-    threading.Thread(target=pump_cf, daemon=True).start()
+
+def pump_cf(proc):
+    for line in proc.stdout:
+        line = redact(line.rstrip())
+        with cf_lock:
+            cf_lines.append(line)
+            del cf_lines[:-500]
+        _raw.write(f"[cloudflared] {line}\n")
+
+
+def start_tunnel(protocol=None):
+    """Start cloudflared: `tunnel run` (named, stable URL) or quick tunnel (random URL).
+
+    The named-tunnel token travels via the TUNNEL_TOKEN environment variable,
+    never argv (argv is visible in process listings and logs).
+    """
+    global tunnel_protocol
+    if cf_hostname:
+        protocol = (protocol or CFG.get("cloudflare_protocol", "auto") or "auto").strip().lower()
+        if protocol not in ("auto", "http2", "quic"):
+            log(f"   invalid cloudflare_protocol={protocol!r}; using auto")
+            protocol = "auto"
+        # auto negotiates (usually QUIC); the watcher retries drops over http2 (TCP).
+        cmd = [str(CLOUDFLARED), "tunnel", "--no-autoupdate"]
+        if protocol != "auto":
+            cmd += ["--protocol", protocol]
+        cmd += ["run"]
+        tunnel_protocol = protocol
+        child_env = {**os.environ, "TUNNEL_TOKEN": cf_token}
+    else:
+        cmd = [str(CLOUDFLARED), "tunnel", "--url", f"http://127.0.0.1:{PORT}",
+               "--no-autoupdate", "--protocol", "quic"]
+        child_env = None
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True, env=child_env)
+    threading.Thread(target=pump_cf, args=(proc,), daemon=True).start()
+    return proc
+
+
+def report_tunnel_exit(proc, protocol):
+    """Log why cloudflared exited. The token is redacted; it never hits argv."""
+    if proc.pid in reported_tunnel_pids:
+        return
+    reported_tunnel_pids.add(proc.pid)
+    time.sleep(0.2)  # let the stdout pump drain after process exit
+    with cf_lock:
+        tail = list(cf_lines[-5:])
+    log(f"   cloudflared exited (rc={proc.returncode}, protocol={protocol})")
+    for line in tail:
+        log("   cloudflared:", redact(line))
+
+
+if cf_hostname:
+    # The hostname->localhost route lives in Cloudflare, not here: the URL is
+    # stable across reconnects even while its connector restarts below.
+    url = f"https://{cf_hostname}"
+    tunnel = start_tunnel()
+    time.sleep(3)
+    if tunnel.poll() is not None:
+        report_tunnel_exit(tunnel, tunnel_protocol)
+else:
+    tunnel = start_tunnel()
+    pat = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com")
     deadline = time.time() + 180
     while time.time() < deadline and url is None:
-        for ln in lines:
+        with cf_lock:
+            snapshot = list(cf_lines)
+        for ln in snapshot:
             m = pat.search(ln)
             if m:
                 url = m.group(0).rstrip("/")
@@ -1096,9 +1332,37 @@ if CLOUDFLARED.exists():
 if url:
     log(f"   your endpoint will be  {url}/v1")
     log("   (not live yet — it answers 502 until the READY banner below)")
+    if cf_hostname:
+        log("   named tunnel: stable URL with automatic reconnect")
     publish("tunnel-url", endpoint=f"{url}/v1")
 else:
     publish("tunnel-failed", note="server still reachable inside the kernel on :8000")
+
+if cf_hostname and tunnel:
+    # A named tunnel can drop its connector while the TPU server stays healthy.
+    # Restart it in place with auto<->http2 backoff; the public hostname is unchanged.
+
+    def watch_tunnel():
+        global tunnel
+        failures = 0
+        while True:
+            time.sleep(10)
+            if tunnel.poll() is None:
+                failures = 0
+                continue
+            failed_protocol = tunnel_protocol
+            report_tunnel_exit(tunnel, failed_protocol)
+            failures += 1
+            delay = min(60, 2 ** min(failures, 5))
+            next_protocol = "http2" if failed_protocol == "auto" else "auto"
+            publish("tunnel-reconnecting", endpoint=f"{url}/v1", retry_secs=delay,
+                    protocol=next_protocol)
+            log(f"   cloudflared disconnected; retrying with {next_protocol} in {delay} s")
+            time.sleep(delay)
+            replacement = start_tunnel(next_protocol)
+            if replacement is not None:
+                tunnel = replacement
+    threading.Thread(target=watch_tunnel, daemon=True).start()
 
 # ---------------- 6. wait, announce, self-test, keep alive ----------------
 startup = wait_healthy(server, CFG, expect_min)
@@ -1107,18 +1371,18 @@ log("")
 log("#" * 70)
 log(f"#  READY — the server is live ({elapsed()} after start)")
 log(f"#  ENDPOINT : {url + '/v1' if url else 'http://127.0.0.1:8000/v1 (tunnel failed)'}")
-log(f"#  API KEY  : {CFG['api_key']}")
+log("#  API key  : see your launcher terminal (rendered from local state, never sent over ntfy)")
 log(f"#  MODEL    : {CFG['served_model_name']}   (context {CFG['max_model_len']}, "
     f"{CFG['max_num_seqs']} parallel requests)")
 log("#" * 70)
 log("#  Try it:")
 log(f"#    curl {url + '/v1' if url else 'http://127.0.0.1:8000/v1'}/chat/completions \\")
-log(f"#      -H 'Authorization: Bearer {CFG['api_key']}' -H 'Content-Type: application/json' \\")
+log('#      -H "Authorization: Bearer $INFERENCE_API_KEY" -H "Content-Type: application/json" \\')
 log("#      -d '{\"model\": \"" + CFG["served_model_name"] + "\", \"messages\": [{\"role\": \"user\", "
     "\"content\": \"Hello!\"}], \"chat_template_kwargs\": {\"reasoning_effort\": \"low\"}}'")
 log(f"#  Serving for up to {CFG['keepalive_min']} min, then this cell exits on its own.")
 log("#" * 70)
-publish("ready", endpoint=(f"{url}/v1" if url else None), api_key=CFG["api_key"],
+publish("ready", endpoint=(f"{url}/v1" if url else None),
         model=CFG["served_model_name"], max_model_len=CFG["max_model_len"],
         keepalive_min=CFG["keepalive_min"], startup_secs=startup)
 
