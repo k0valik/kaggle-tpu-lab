@@ -161,9 +161,75 @@ def sh(cmd, tag, show=None, env=None):
 def find_input(*patterns):
     """Datasets mount at /kaggle/input/<slug> (UI) or /kaggle/input/datasets/<owner>/<slug> (API push)."""
     for pat in patterns:
-        hits = glob.glob(f"/kaggle/input/{pat}") + glob.glob(f"/kaggle/input/datasets/*/{pat}")
+        if not pat:
+            continue
+        # Absolute/explicit path passed straight through (e.g. a full mount path).
+        if os.path.isabs(pat) and os.path.exists(pat):
+            return pat
+        hits = (glob.glob(f"/kaggle/input/{pat}")
+                + glob.glob(f"/kaggle/input/datasets/*/{pat}")
+                + glob.glob(f"/kaggle/input/datasets/*/*/{pat}"))
         if hits:
             return hits[0]
+    return None
+
+
+def hf_token():
+    """HF token for gated/private checkpoints.
+
+    Lookup: launcher CFG ``hf_token`` -> env ``HF_TOKEN`` /
+    ``HUGGING_FACE_HUB_TOKEN`` -> Kaggle secret ``HF_TOKEN`` at runtime.
+    Best-effort: never raises, and callers must never log the value.
+    """
+    try:
+        v = (CFG.get("hf_token") or "").strip()
+        if v:
+            return v
+    except Exception:
+        pass
+    for key in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"):
+        try:
+            v = (os.environ.get(key) or "").strip()
+            if v:
+                return v
+        except Exception:
+            continue
+    try:
+        from kaggle_secrets import UserSecretsClient
+        v = (UserSecretsClient().get_secret("HF_TOKEN") or "").strip()
+        if v:
+            return v
+    except Exception:
+        pass
+    return ""
+
+
+def _weights_dataset_is_empty(v):
+    """Empty/placeholder dataset means 'HF download inside the kernel'."""
+    if v is None:
+        return True
+    return str(v).strip().lower() in ("", "none")
+
+
+def chat_template(model_dir):
+    """Return the chat-template string for a checkpoint dir, or None.
+
+    transformers v4 keeps it in ``tokenizer_config.json["chat_template"]``;
+    v5 moved it to a sibling ``chat_template.jinja`` file (missing key used
+    to raise KeyError). Pure logic: safe to unit-test against fixtures.
+    """
+    try:
+        tc = json.loads(Path(model_dir, "tokenizer_config.json").read_text())
+        if tc.get("chat_template"):
+            return tc["chat_template"]
+    except Exception:
+        pass
+    try:
+        tpl = Path(model_dir, "chat_template.jinja").read_text()
+        if tpl.strip():
+            return tpl
+    except Exception:
+        pass
     return None
 
 
@@ -394,10 +460,11 @@ else:
 
 
 def complete_bf16_repo(path):
-    """Validate a mounted bf16 weights mirror. Returns (ok, detail).
+    """Validate a mounted checkpoint mirror. Returns (ok, detail).
 
-    Strictly reject an invalid/missing safetensors index or missing shards.
-    The Hugging Face size cross-check is best-effort when the API is reachable.
+    Model-agnostic: requires a valid safetensors index plus all shards
+    present on disk; the Hugging Face size cross-check is best-effort
+    when the API is reachable.
     """
     idx = os.path.join(path, "model.safetensors.index.json")
     try:
@@ -430,32 +497,86 @@ def complete_bf16_repo(path):
 
 
 # ---------------- 3. weights ----------------
-banner(3, "Model weights", "55 GB bf16 safetensors")
-weights_slug = CFG["weights_dataset"].split("/")[-1]
-model_path = find_input(weights_slug)
+banner(3, "Model weights", "Qwen3.8-27B checkpoint (safetensors)")
+os.environ.setdefault("HF_HUB_DISABLE_XET", "1")       # XET breaks on some Kaggle images; env override respected
+os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "60")  # slow-start mirrors need more than the default
+weights_cfg = CFG.get("weights_dataset") or ""
+weights_slug = weights_cfg.split("/")[-1].strip()
+model_path, weights_from = None, None
 detail = "no local mirror"
-if model_path and os.path.exists(os.path.join(model_path, "config.json")):
-    ok, detail = complete_bf16_repo(model_path)
-    if ok:
-        publish("weights-mounted", path=model_path, detail=detail)
+if not _weights_dataset_is_empty(weights_cfg):
+    cand = find_input(weights_slug) if weights_slug else None
+    if cand and os.path.exists(os.path.join(cand, "config.json")):
+        ok, detail = complete_bf16_repo(cand)
+        if ok:
+            model_path = cand
+            weights_from = f"dataset:{weights_cfg}"
+            publish("weights-mounted", path=model_path, detail=detail)
+        else:
+            log(f"   checkpoint mirror incomplete ({detail}) -> downloading from HF")
+            detail = f"mirror incomplete ({detail})"
     else:
-        log(f"   mirror incomplete ({detail}) -> downloading from HF")
-        model_path = None
+        detail = f"dataset '{weights_cfg}' not mounted"
+        log(f"   {detail} -> downloading from HF")
 if not model_path:
+    reason = detail if not _weights_dataset_is_empty(weights_cfg) else "weights dataset empty/none -> HF download"
     publish("weights-download", model=CFG["hf_model_id"],
             note="attach the weights dataset to skip this (~5 min parallel download)",
-            reason=detail)
+            reason=reason)
+    try:
+        from huggingface_hub import HfApi
+        _api = HfApi(token=hf_token() or None)
+        _info = _api.model_info(CFG["hf_model_id"])
+        _need = sum(getattr(s, "size", 0) or 0 for s in (_info.siblings or []) if getattr(s, "size", 0))
+        _dir = os.environ.get("HF_HOME", "/tmp")
+        while not os.path.exists(_dir):  # /tmp/hf may not exist yet -> nearest parent
+            _dir = os.path.dirname(_dir) or "/"
+        _free = shutil.disk_usage(_dir).free
+        if _need:
+            log(f"   HF preflight: need ~{_need / 1e9:.1f} GB, free {_free / 1e9:.1f} GB")
+            if _free < _need:
+                msg = (f"not enough disk for {CFG['hf_model_id']}: "
+                       f"need ~{_need / 1e9:.1f} GB, free {_free / 1e9:.1f} GB")
+                publish("failed", step="weights-download", tail=msg)
+                sys.exit(1)
+    except SystemExit:
+        raise
+    except Exception as e:
+        log(f"   note: HF size preflight skipped ({e})")
     t = time.time()
     from huggingface_hub import snapshot_download
     model_path = snapshot_download(CFG["hf_model_id"], allow_patterns=[
-        "*.safetensors", "*.json", "*.txt", "*.jinja", "tokenizer*", "vocab*", "merges*"])
+        "*.safetensors", "*.json", "*.txt", "*.jinja", "tokenizer*", "vocab*", "merges*"],
+        token=hf_token() or None)
+    weights_from = f"hf:{CFG['hf_model_id']}"
     try:
         dl = [f for f in os.listdir(model_path) if f.endswith(".safetensors")]
         total = sum(os.path.getsize(os.path.join(model_path, f)) for f in dl)
         log(f"   downloaded {len(dl)} shards, {total / 1e9:.1f} GB")
     except Exception as e:
         log(f"   (download inventory skipped: {e})")
-    publish("weights-downloaded", secs=int(time.time() - t))
+    # Download progress: log-lines-only (no background weights-progress thread;
+    # snapshot_download blocks and HF_HOME polling added noise in review).
+    ok, vdetail = complete_bf16_repo(model_path)
+    log(f"   snapshot validation: {'OK' if ok else 'WARN'} ({vdetail})")
+    publish("weights-downloaded", secs=int(time.time() - t), detail=vdetail)
+
+# FP8 rule: a non-default checkpoint has different graphs, so the prebaked
+# BF16 XLA cache must NOT count as a hit. The cache section above ran before
+# weights resolution, so invalidate its verdict here explicitly.
+weights_is_default = (weights_from in (f"dataset:{DEFAULTS['weights_dataset']}",
+                                       f"hf:{DEFAULTS['hf_model_id']}"))
+if not weights_is_default and n_entries:
+    # Do not even consult the stale entries: XLA cache keys may not cover
+    # weight bytes, so a false hit would serve wrong outputs. Worst case
+    # here is an honest cold compile.
+    fresh_cache = "/tmp/xla_cache_custom"
+    os.makedirs(fresh_cache, exist_ok=True)
+    os.environ["VLLM_XLA_CACHE_PATH"] = fresh_cache
+    log(f"   non-default weights source ({weights_from}): the BF16 XLA cache "
+        f"does NOT count as a hit (different graphs) -> compiling cold")
+    publish("cache-bypassed", weights_from=weights_from,
+            reason="non-default checkpoint: BF16 cache miss, compiling cold")
 
 
 # ---------------- 4. vLLM server ----------------
@@ -494,12 +615,16 @@ def server_args(cfg):
     if cfg["reasoning_effort_default"] != "xhigh":
         # The chat template defaults reasoning_effort to 'xhigh'; ship a copy with a
         # different default so the server-side default changes without client changes.
-        tc = json.loads(Path(model_path, "tokenizer_config.json").read_text())
-        template = tc["chat_template"].replace(
-            "reasoning_effort|default('xhigh')",
-            f"reasoning_effort|default('{cfg['reasoning_effort_default']}')")
-        Path("/tmp/chat_template.jinja").write_text(template)
-        args += ["--chat-template", "/tmp/chat_template.jinja"]
+        template = chat_template(model_path)
+        if template is None:
+            log("   warn: no chat template found (tokenizer_config.json lacks "
+                "'chat_template' and no chat_template.jinja) -> keeping server default")
+        else:
+            template = template.replace(
+                "reasoning_effort|default('xhigh')",
+                f"reasoning_effort|default('{cfg['reasoning_effort_default']}')")
+            Path("/tmp/chat_template.jinja").write_text(template)
+            args += ["--chat-template", "/tmp/chat_template.jinja"]
     return args
 
 
@@ -841,10 +966,11 @@ if CFG["build_bundle"]:
     sys.exit(0)
 
 # ---------------- 4. launch ----------------
-expect_min = (10 if n_entries else 20) + (0 if CFG["text_only"] else (10 if n_entries else 15))
+cache_hit = bool(n_entries) and weights_is_default  # bypassed above for custom weights
+expect_min = (10 if cache_hit else 20) + (0 if CFG["text_only"] else (10 if cache_hit else 15))
 if CFG["fast_start"]:
-    expect_min = 5 if n_entries else 7
-    if not n_entries:
+    expect_min = 5 if cache_hit else 7
+    if not cache_hit:
         log("   fast_start without a compile cache: every new request shape will compile "
             "cold (~1 min each) — attach the env dataset for this mode to make sense")
 banner(4, "Starting vLLM", f"TP=8, ctx {CFG['max_model_len']}, {CFG['max_num_seqs']} seqs, "

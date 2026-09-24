@@ -51,10 +51,12 @@ PHASE_TEXT = {
     "mtp-patch-failed":   "MTP patch did not apply — speculative decoding disabled for safety.",
     "cache-restored":     None,  # rendered below (depends on config coverage)
     "cache-missing":      "No compile cache found — cold compile, add ~10 min.",
+    "cache-bypassed":     "Custom checkpoint: prebaked XLA cache ignored — compiling cold.",
     "weights-mounted":    "Weights found mounted (no download needed).",
     "weights-download":   "Downloading weights from Hugging Face (~5 min)...",
+    "weights-progress":   "Downloading weights from Hugging Face...",
     "weights-downloaded": "Weights downloaded.",
-    "server-launch":      "Starting vLLM — loading 55 GB of weights, then TPU graph compile...",
+    "server-launch":      "Starting vLLM — loading the checkpoint weights, then TPU graph compile...",
     "loading":            "Loading the weights onto the chips (~9 min)...",
     "loaded":             None,
     "warmed":             None,
@@ -99,6 +101,21 @@ def kaggle_username(cli_arg):
     sys.exit("Could not detect your Kaggle username — pass it with --user <name>.")
 
 
+def optional_dataset(name):
+    """Normalize a Kaggle dataset arg: '', 'none', 'null' or '-' (any case) means 'not mounted'.
+
+    Returns "" for "no dataset" so callers can filter empties out of
+    dataset_sources; an empty value means "HF download inside the kernel",
+    never a bogus source.
+    """
+    if name is None:
+        return ""
+    s = str(name).strip()
+    if s.lower() in ("", "none", "null", "-"):
+        return ""
+    return s
+
+
 def engine_b64(pkg_dir):
     """The engine package (its .py files) as a base64 tar.gz, embedded into the kernel script."""
     buf = io.BytesIO()
@@ -117,6 +134,7 @@ def cmd_serve(args):
     api_key = ("glm-" if args.model == "glm53-flash" else "sk-") + secrets.token_hex(16)
 
     if args.model == "qwen38-27b":
+        weights_dataset = optional_dataset(args.weights_dataset)
         cfg = {
             "ntfy_topic": topic,
             "api_key": api_key,
@@ -125,7 +143,9 @@ def cmd_serve(args):
             "mtp_tokens": args.mtp,
             "reasoning_effort_default": args.reasoning_effort,
             "keepalive_min": args.keepalive_min,
-            "weights_dataset": args.weights_dataset,
+            "weights_dataset": weights_dataset,
+            "hf_model_id": args.hf_model_id,
+            "served_model_name": args.served_model_name,
         }
         if args.no_tools:
             cfg["tool_call_parser"] = ""
@@ -137,7 +157,7 @@ def cmd_serve(args):
             cfg["fast_start"] = True
         if args.no_async_scheduling:
             cfg["async_scheduling"] = False
-        datasets = [args.weights_dataset, ENV_DATASET]
+        datasets = [d for d in [weights_dataset, ENV_DATASET] if d]
     else:
         cfg = {
             "ntfy_topic": topic,
@@ -250,6 +270,9 @@ def render_event(ev):
     elif phase == "benchmark":
         say(f"Quick benchmark: {ev.get('decode_tok_s', '?')} tok/s single-stream decode "
             f"(sanity: {ev.get('sanity', '')!r})")
+    elif phase == "weights-progress":
+        say(f"Downloading weights... {ev.get('downloaded_gb', '?')} GB downloaded "
+            f"({ev.get('free_gb', '?')} GB free)")
     elif phase == "ready":
         print("\n" + "=" * 66)
         print("  YOUR ENDPOINT IS LIVE")
@@ -345,6 +368,10 @@ def cmd_build_env(args):
     check_auth()
     user = kaggle_username(args.user)
     topic = "ktl-" + uuid.uuid4().hex[:20]
+    # B1 note: build-env intentionally passes only --weights-dataset. It builds the
+    # env/XLA-cache bundle against the default BF16 weights; hf_model_id /
+    # served_model_name are serve-time weights-source options with no corresponding
+    # build-env flags, so there is nothing trivially consistent to pass through here.
     cfg = {"build_bundle": True, "ntfy_topic": topic, "weights_dataset": args.weights_dataset}
     src = KERNEL_SRC.read_text()
     src, n = re.subn(r"^CFG = None  # __LAUNCHER_CONFIG__.*$",
@@ -432,7 +459,16 @@ def main():
                         "(qwen38-27b: xhigh | medium | low; glm53-flash: low | medium | high, default low)")
     s.add_argument("--keepalive-min", type=int, default=480,
                    help="auto-shutdown after this many minutes of serving")
-    s.add_argument("--weights-dataset", default=WEIGHTS_DATASET)
+    s.add_argument("--weights-dataset", default=WEIGHTS_DATASET,
+                     help="qwen38-27b: Kaggle dataset with the weights (e.g. your own FP8 quant). "
+                          "'', 'none', 'null' or '-' (case-insensitive) = no dataset mount; "
+                          "the kernel downloads from Hugging Face instead (see --hf-model-id). "
+                          f"(default: {WEIGHTS_DATASET})")
+    s.add_argument("--hf-model-id", default="Qwen/Qwen3.8-27B",
+                     help="qwen38-27b: Hugging Face repo downloaded when no weights dataset "
+                          "is mounted (i.e. --weights-dataset none)")
+    s.add_argument("--served-model-name", default="qwen3.8-27b",
+                     help="qwen38-27b: model name advertised by the OpenAI-compatible API")
     s.add_argument("--no-tools", action="store_true",
                    help="disable tool-calling support")
     s.add_argument("--text-only", action="store_true",
