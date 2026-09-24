@@ -109,3 +109,8 @@ No third-party checkpoint presets, no `quickstart.sh/ps1`, no
       new log lines.
 - [ ] Deferred-live: BF16 cache-hit run, HF-download run, FP8-dataset run,
       gated-repo run, MTP on FP8.
+- [ ] Deferred-live, tracked (double-pass V6): `tpu-inference#3399` (4 GiB
+      VFIO / weight-resharding failure, still open upstream 2026-09-24, no
+      published fix). If a weight load fails with `RESOURCE_EXHAUSTED` /
+      ioctl 4 GiB signatures, record the full trace; the fix must come
+      upstream — do not invent a loader patch (cf. PR #1 docs).

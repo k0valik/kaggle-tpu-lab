@@ -48,6 +48,12 @@ hygiene, foreground fetch), PR #5 (state `0600`).
   benchmark-deleting README. REVIEW (decide in build): full HMAC
   `sign/verify` protocol, `SESSION_DIR` isolation. Double-pass: re-check
   `sync_security.py`/`test_hardening.py` patterns for the Stage E harness.
+  Double-pass V3 outcome: both CONFIRM-REJECT (narrow transport-only
+  adversary, hard protocol break, single-tenant VM). Known-accepted:
+  `benchmark`/`image-test` phases publish truncated model-output excerpts
+  to the random-topic feed — HMAC wouldn't fix that (signed≠encrypted);
+  topic entropy is the barrier; revisit only if excerpts carry sensitive
+  content.
 - [#9](https://github.com/k0valik/kaggle-tpu-lab/pull/9) (KiVixx):
   Named tunnel (`start_tunnel`/`watch_tunnel`), `TUNNEL_TOKEN` env,
   `KTL_API_KEY`-style secret, foreground fetch, `--use-xet`. IGNORE

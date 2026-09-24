@@ -144,10 +144,23 @@ def fail(step, msg):
     sys.exit(1)
 
 
+def sanitize_tpu_env():
+    """Drop poisoned TPU_WORKER_* vars (Kaggle metadata WARNING text breaks PJRT
+    mesh init on a single-VM v5e-8, which never needs them). Same as Qwen (Ref: #8)."""
+    dropped = []
+    for name in ("TPU_WORKER_HOSTNAMES", "TPU_WORKER_ADDRS"):
+        val = os.environ.pop(name, None)
+        if val is not None:
+            dropped.append(f"{name}={val.strip()[:70]!r}")
+    if dropped:
+        log("   removed TPU metadata env vars: " + ", ".join(dropped))
+
+
 def preflight():
     """Look before the slow steps (~20 s): the datasets attached, Internet on (pip, cloudflared) and a real TPU present.
     Kaggle sometimes starts a "TPU" session with no TPU (a CPU-only container, most often on new or not-yet-verified
     accounts): jax then sees one CPU device and the build dies minutes later with a sharding error."""
+    sanitize_tpu_env()
     need = list(CFG["expert_datasets"]) + ([] if CFG["serve_dataset"] and mounts_of([CFG["serve_dataset"]]) else
                                            ([CFG["serve_dataset"]] if CFG["serve_dataset"] and not mounts_of(CFG["base_datasets"]) else list(CFG["base_datasets"])))
     missing = [n for n in need if not mounts_of([n])]
@@ -1261,6 +1274,8 @@ if globals().get("SERVE_FOREVER", True):
     while time.time() - t_serve < CFG["keepalive_min"] * 60:
         time.sleep(120)
         if SCHED.thread is not None and not SCHED.thread.is_alive():
+            log("   the engine scheduler exited before the scheduled auto-shutdown "
+                "(last error above, if any) — stopping now")
             publish("stopped", reason="scheduler-exit")
             sys.exit(1)
         up = int((time.time() - t_serve) / 60)

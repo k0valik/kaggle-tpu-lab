@@ -677,6 +677,62 @@ elif CFG["mtp_tokens"] > 0:
     CFG["mtp_tokens"] = 0
 log(f"   runtime ready in {int(time.time() - t)} s")
 
+
+def safe_tar_members(archive):
+    """Reject tar-slip members (absolute paths, `..`) before extraction.
+
+    The XLA cache comes from a user-attached dataset, not a pinned release,
+    so its tarball is untrusted input. Raises ValueError on the first unsafe
+    member; returns the member count otherwise. (Double-pass V3.)
+    """
+    import tarfile
+    with tarfile.open(archive) as tf:
+        members = tf.getmembers()
+    bad = [m.name for m in members
+           if os.path.isabs(m.name) or ".." in Path(m.name).parts]
+    if bad:
+        raise ValueError(f"unsafe tar members in {archive}: {bad[:3]}")
+    return len(members)
+
+
+# Architecture keys that decide XLA graph compatibility. A finetune whose
+# config matches the base on these reuses compiled graphs; anything else
+# (e.g. an FP8 quant with a reshaped head) compiles cold. (Double-pass V1.)
+CONFIG_SHAPE_KEYS = ("hidden_size", "num_hidden_layers", "num_attention_heads",
+                     "num_key_value_heads", "intermediate_size", "vocab_size",
+                     "model_type", "architectures")
+
+
+def configs_compatible(local_cfg, base_cfg):
+    """Pure shape-compat check for two config.json dicts. Safe to unit-test."""
+    try:
+        return all(local_cfg.get(k) == base_cfg.get(k) for k in CONFIG_SHAPE_KEYS)
+    except Exception:
+        return False
+
+
+def fetch_base_config():
+    """Base Qwen/Qwen3.8-27B config.json, best-effort. {} on any failure."""
+    try:
+        url = "https://huggingface.co/Qwen/Qwen3.8-27B/resolve/main/config.json"
+        with urllib.request.urlopen(url, timeout=15) as r:
+            return json.loads(r.read().decode())
+    except Exception as e:
+        log(f"   note: base config fetch skipped ({e})")
+        return {}
+
+
+def has_mtp_head(model_dir):
+    """True if the checkpoint index names MTP tensors. False on any doubt
+    (fail-safe: a missing/unreadable index must not enable speculation)."""
+    try:
+        idx = json.loads(Path(model_dir, "model.safetensors.index.json").read_text())
+        names = idx.get("weight_map", {})
+        return any("mtp" in n.lower() for n in names)
+    except Exception:
+        return False
+
+
 # ---------------- 2. XLA compile cache ----------------
 banner(2, "XLA compile cache")
 t = time.time()
@@ -684,6 +740,11 @@ cache_tar = (Path(bundle, "xla_cache.tar") if bundle and Path(bundle, "xla_cache
              else find_input("*/xla_cache*.tar.gz", "xla_cache*.tar.gz"))
 cache_dir = find_input("*/*/xla_cache", "*/xla_cache", "xla_cache")
 if cache_tar:
+    try:
+        safe_tar_members(str(cache_tar))
+    except ValueError as e:
+        publish("failed", step="cache-extract", tail=str(e))
+        sys.exit(1)
     flags = "-xf" if str(cache_tar).endswith(".tar") else "-xzf"
     sh(["tar", flags, str(cache_tar), "-C", "/tmp"], "tar")
 elif cache_dir:
@@ -808,11 +869,21 @@ if not model_path:
     publish("weights-downloaded", secs=int(time.time() - t), detail=vdetail)
 
 # FP8 rule: a non-default checkpoint has different graphs, so the prebaked
-# BF16 XLA cache must NOT count as a hit. The cache section above ran before
-# weights resolution, so invalidate its verdict here explicitly.
+# BF16 XLA cache must NOT count as a hit — unless its config.json matches
+# the base architecture (a byte-compatible finetune reuses compiled graphs).
+# The cache section above ran before weights resolution, so invalidate its
+# verdict here explicitly.
 weights_is_default = (weights_from in (f"dataset:{DEFAULTS['weights_dataset']}",
                                        f"hf:{DEFAULTS['hf_model_id']}"))
-if not weights_is_default and n_entries:
+config_compatible = False
+if not weights_is_default and model_path:
+    try:
+        local_cfg = json.loads(Path(model_path, "config.json").read_text())
+        config_compatible = configs_compatible(local_cfg, fetch_base_config())
+        log(f"   checkpoint config vs base: {'compatible (cache reusable)' if config_compatible else 'diverged (compiling cold)'}")
+    except Exception as e:
+        log(f"   checkpoint config check skipped ({e}) -> compiling cold")
+if not weights_is_default and not config_compatible and n_entries:
     # Do not even consult the stale entries: XLA cache keys may not cover
     # weight bytes, so a false hit would serve wrong outputs. Worst case
     # here is an honest cold compile.
@@ -823,6 +894,25 @@ if not weights_is_default and n_entries:
         f"does NOT count as a hit (different graphs) -> compiling cold")
     publish("cache-bypassed", weights_from=weights_from,
             reason="non-default checkpoint: BF16 cache miss, compiling cold")
+if not weights_is_default and CFG["mtp_tokens"] > 0:
+    log("   warn: non-default (possibly FP8) weights with MTP on is NEEDS-LIVE-TEST: "
+        "no dtype hazard in mtp-rollback-v0290.diff, but the exact-match A/B "
+        "(mtp 3 vs 0) has not been run on this checkpoint class yet")
+# MTP-head fallback (Ref: #2): a checkpoint without MTP tensors cannot serve
+# speculative decoding — fail over to mtp=0 here, before server_args(), rather
+# than deep in vLLM startup. Recompute the cache-coverage verdict below so the
+# published event matches the actually-served config.
+if model_path and CFG["mtp_tokens"] > 0 and not has_mtp_head(model_path):
+    log("   no MTP tensors in index -> disabling speculative decoding (mtp_tokens=0)")
+    publish("mtp-disabled", reason="no MTP tensors in index — serving without speculative decoding")
+    CFG["mtp_tokens"] = 0
+    if n_entries:
+        new_config = [CFG["max_model_len"], CFG["max_num_seqs"], CFG["mtp_tokens"], CFG["text_only"]]
+        new_covered = (not cache_configs) or (new_config in cache_configs)
+        if new_covered != covered:
+            covered = new_covered
+            log(f"   cache coverage after MTP fallback: {covered} for {new_config}")
+            publish("cache-restored", entries=n_entries, secs=0, covers_this_config=covered)
 
 
 # ---------------- 4. vLLM server ----------------
@@ -844,6 +934,8 @@ def server_args(cfg):
             "--api-key", cfg["api_key"],
             "--served-model-name", cfg["served_model_name"],
             "--reasoning-parser", "qwen3"]
+    # Deferred-live (Stage A NEEDS-LIVE-TEST): try boot WITHOUT --trust-remote-code
+    # first; add it here only if Qwen/Qwen3.8-27B fails to load.
     if cfg.get("async_scheduling") is not None:
         args.append("--async-scheduling" if cfg["async_scheduling"] else "--no-async-scheduling")
     if cfg["text_only"]:
@@ -1134,6 +1226,11 @@ def exercise(cfg, quiet=False):
 
 
 # ---------------- maintainer mode: build the env dataset ----------------
+# Keep in sync with `launch.py serve` cache-relevant flags: every
+# (max_model_len, max_num_seqs, mtp_tokens, text_only) tuple the env dataset
+# should serve warm needs an entry here, or runs compile cold. Deliberate:
+# --mtp 0 has NO entry (cold compile by decision — the bundle build costs a
+# full serve pass per entry; see tests/test_build_configs.py). Pinned by test.
 BUILD_CONFIGS = [
     {"max_model_len": 262144, "max_num_seqs": 4, "mtp_tokens": 3, "text_only": False},
     {"max_model_len": 131072, "max_num_seqs": 16, "mtp_tokens": 3, "text_only": False},
@@ -1219,7 +1316,7 @@ if CFG["build_bundle"]:
     sys.exit(0)
 
 # ---------------- 4. launch ----------------
-cache_hit = bool(n_entries) and weights_is_default  # bypassed above for custom weights
+cache_hit = bool(n_entries) and (weights_is_default or config_compatible)  # bypassed above for divergent custom weights
 expect_min = (10 if cache_hit else 20) + (0 if CFG["text_only"] else (10 if cache_hit else 15))
 if CFG["fast_start"]:
     expect_min = 5 if cache_hit else 7

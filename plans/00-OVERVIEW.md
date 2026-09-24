@@ -66,3 +66,17 @@ land, do a second pass over each PR against this table to catch misses.
 | [#7](https://github.com/k0valik/kaggle-tpu-lab/pull/7) | nxhung1610 | DFlash2 TPU | IGNORE entirely (new drafter); keep only the abstract mutual-exclusion rule | none |
 | [#8](https://github.com/k0valik/kaggle-tpu-lab/pull/8) | codewith-aditya | Fix kaggle issues | LIFT `sanitize_tpu_env()`, `internet_check()`, `_LOG_START`, `server_died()` hints; IGNORE KYC prose, backslash regression | C |
 | [#9](https://github.com/k0valik/kaggle-tpu-lab/pull/9) | KiVixx | Stable custom endpoint | LIFT `optional_dataset()`, HF preflight/validation, XET toggle, secrets plumbing, named tunnel, sync concept; IGNORE uncensored notebooks, zh-TW doc, queue monitor | B, D, E |
+
+## Double-pass (2026-09-24, all stages landed)
+
+Six sequential verifications (V1–V6), then one fix batch. Accepted gaps,
+all landed: config-compat check + MTP-head fallback (V1), 2 trivial GLM
+ports (V2), XLA tar-slip guard + fail-hard/push-secrecy tests (V3),
+BUILD_CONFIGS sync comment + pin test (V4), ARahim3→k0valik URL hygiene
+(V5), trust-remote-code comment + MTP-on-FP8 warning + #3399 tracking
+(V6). Confirmed rejections: `--use-xet` flag, HMAC protocol, SESSION_DIR,
+template-flow helpers, hint-split, GPU paths, DFlash2, all hardcoded
+checkpoints. No MISSED hunk in any PR (V2/V4/V6 censuses). Standing
+deferred-live items: TPU re-measurement, MTP A/B (bf16 + FP8), APC
+hit-rate, JSON-mode crash repro, trust-remote-code probe, named-tunnel
+e2e, CPU-landing of build-weights.
