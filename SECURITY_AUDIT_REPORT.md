@@ -211,3 +211,133 @@ The codebase is safe for compilation, distribution, and usage.
 
 ### Red Flags:
 *None detected.*
+
+# 17. Secondary Audit — Gap-Driven Linux Review
+
+## 17.1 Scope
+
+This secondary security audit was performed on a Linux evaluation VM to investigate specific gaps, implicit claims, and unverified assumptions documented in the initial audit (`SECURITY_AUDIT_REPORT.md`). Rather than repeating baseline checks, this review focused on dependency supply-chain details (NPM/Cargo lockfile URLs, lifecycle scripts, proc macros, build scripts), GitHub Actions CI supply-chain security, deep Git object graph forensics (`git fsck`), static Windows installer/bundle configurations, secret/log redaction flows, executable resolution/PATH handling, build-time network monitoring, and Cloudflared binary integrity verification.
+
+## 17.2 Findings Summary
+
+Overall secondary assessment:
+`LOW concern` (Zero malicious indicators found; minor supply-chain and PATH resolution hygiene observations documented).
+
+| Severity | Finding | Component | Evidence | Exploitability | Malware relevance | Recommendation |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **INFORMATIONAL** | GitHub Actions Tag Pinning | `.github/workflows/check.yml` | Uses `@v4` and `@v5` tag refs for third-party actions (`actions/checkout`, `actions/setup-python`). | Low (Requires upstream action repository compromise). | None (Benign standard CI workflow). | Pin GitHub Actions to full 40-character immutable commit SHAs. |
+| **INFORMATIONAL** | Relative PATH Executable Resolution | `src-tauri/src/process/mod.rs` & `launch.py` | Executable resolution for `python`/`python.exe` and `kaggle` relies on standard `PATH` lookup. | Low (Requires local-user directory hijacking ahead of system PATH). | None (Standard OS executable lookup model). | Consider resolving absolute paths for Python binaries where possible. |
+| **INFORMATIONAL** | Unix Umask Permission Assumption | `src-tauri/src/kaggle/launcher.rs` | Local state and settings file creation uses standard `std::fs::write` without explicit `set_permissions` (`0600`) calls. | Low (Relies on OS process umask for file mode bits). | None (Standard file I/O). | Enforce explicit `0600` permissions via `OpenOptionsExt` / `PermissionsExt` on Unix platforms. |
+
+## 17.3 Risks / Findings First
+
+1. **GitHub Actions Supply-Chain Tag Pinning:** `.github/workflows/check.yml` pins `actions/checkout@v4` and `actions/setup-python@v5` by major version tags rather than immutable commit SHAs. While these are official GitHub actions, tag mutability introduces a potential supply-chain vector if upstream release tags are modified.
+2. **Executable Resolution via PATH:** Subprocess spawning in Rust (`Command::new("python")` / `"python.exe"`) and Python (`shutil.which("kaggle")`) relies on standard system `PATH` resolution. Under standard local user trust models this is normal, but if an attacker can manipulate `PATH` or place malicious binaries in working directories ahead of system paths, arbitrary execution could occur.
+3. **Implicit Permission Modes on State Files:** State files storing the session key (`state.json`) rely on standard `std::fs::write`, which inherits the default process umask on Unix systems rather than explicitly calling platform permission APIs (`0600`).
+
+## 17.4 Dependency / Supply-Chain Findings
+
+- **NPM Package Tree:**
+  - Analyzed `package-lock.json` (136 total resolved packages).
+  - 100% of packages resolved from official `https://registry.npmjs.org/`. Zero non-registry URLs (`git+`, `http:`, `file:`) or custom endpoints found.
+  - `npm audit --omit=dev` reported **0 vulnerabilities**.
+  - Static audit of lifecycle scripts: Only `esbuild` (0.25.12) and `fsevents` (2.3.3) carry `hasInstallScript: true`. Both are standard build-tool native binary distribution helpers without unexpected pre/postinstall hooks.
+- **Cargo / Rust Crate Tree:**
+  - Evaluated via `cargo metadata --locked --format-version 1`. All 442 crate dependencies resolved from the official `crates.io` index (`registry+https://github.com/rust-lang/crates.io-index`).
+  - Screened 44 proc-macro crates and custom build scripts (`build.rs`). Build scripts in direct application dependencies are strictly limited to `tauri_build::build()`.
+- **GitHub Actions Security:**
+  - Triggers restricted to `push` and `pull_request`. No `pull_request_target` or `workflow_run` escalation triggers present.
+  - Workflow runs strictly stdlib validation checks (`py_compile`, unit tests, notebook JSON parsing).
+  - Zero secrets or publish/deployment tokens consumed or exposed.
+
+## 17.5 Git / Provenance Findings
+
+- **Git Object Graph Integrity:**
+  - `git fsck --full --no-reflogs --unreachable` and `git fsck --full --dangling` returned **0 dangling or unreachable objects**.
+  - `git count-objects -vH` verified 0 loose objects and a single 964 KiB clean packfile containing 221 objects.
+- **Ref and Commit Ancestry:**
+  - Checked all refs (`git show-ref`): Repository consists of a clean, linear 2-commit history from `baseline+haz-companion` (`9b45af4`) to current `HEAD` (`73c44db`).
+  - Historical string sweeps across the full object history for deleted sensitive patterns (`powershell`, `CryptUnprotectData`, `GetAsyncKeyState`, `SetWindowsHookEx`, `Invoke-WebRequest`, `curl`, `base64`) confirmed zero deleted malicious payloads or stealth hooks.
+
+## 17.6 Installer / Windows Artifact Static Findings
+
+- **NATIVE WINDOWS INSTALL/EXECUTION WAS NOT PERFORMED.**
+- **Static Installer Audit (`src-tauri/tauri.conf.json`):**
+  - NSIS installer target explicitly sets `"installMode": "currentUser"`, ensuring installations run strictly in user-space without requesting administrative privilege escalation (`UAC`).
+  - Zero custom NSIS scripts, pre/post-install hooks, registry modifications, or external payload download actions are defined.
+- **PE Cross-Compilation Feasibility:**
+  - Attempted target check (`x86_64-pc-windows-gnu`). The evaluation Linux VM lacks the `x86_64-pc-windows-gnu` Rust target standard library (`rustup target add` unavailable in sandbox), preventing compilation of a Windows PE binary on this host.
+
+## 17.7 Secret / Credential Flow Findings
+
+- **In-Memory & Redaction Mechanics:**
+  - `AppState` maintains the generated `api_key` in `Mutex<Option<String>>` in Rust memory.
+  - `sanitize_value()` recursively strips secret fields (`api_key`, `apikey`, `token`, `secret`, `password`, `authorization`, `auth`) before UI snapshot serialization.
+  - `redact_for_log()` masks `sk-...` strings with `sk-[redacted]` before error or status logging.
+  - Clipboard writes (`copy_api_key`, `copy_connection_setup`) execute directly in Rust via `tauri_plugin_clipboard_manager`, keeping raw API keys out of React/JS state.
+- Secondary review identified no additional secret leakage or unredacted exposure paths.
+
+## 17.8 Build / Network Findings
+
+- Network socket monitoring (`ss -taunp`) during `npm run build` and build tasks confirmed zero unexpected outbound network connections (only existing SSH control sockets for sandbox VM management were observed).
+- Build commands operate strictly locally without downloading unverified secondary artifacts.
+
+## 17.9 File / Path / Download Findings
+
+- **Cloudflared Binary Integrity:**
+  - Binary downloads in `serve_qwen38.py` and `serve_glm53.py` are version-pinned (`2026.9.1`) and SHA-256 digest-pinned (`03f1f25d1cc93b9ad6c60569d44060bc4f17ed97075760ed8cfca4b12dcd68cc`).
+  - Checksum re-verification is performed via `verify_sha256()` immediately prior to process execution.
+- **Embedded Base64 Payloads:**
+  - Decoded embedded base64 string `MTP_PATCH_B64` in `qwen38-27b/kernel/serve_qwen38.py`.
+  - Content verified as a compressed gzip patch applying upstream bugfix PR #3178 (`tpu_inference` GDN state rollback for speculative decoding).
+
+## 17.10 Additional Malware Indicators
+
+None discovered during the secondary pass.
+
+## 17.11 Gaps That Remain
+
+The following checks cannot be established from a Linux host environment and require a physical Windows system:
+
+1. Native Windows NSIS/MSI installer execution and GUI setup verification.
+2. Native Windows registry, runtime filesystem creation, and process tree isolation behavior under Windows kernel semantics.
+3. Windows ACL file permission verification on `%APPDATA%` state and settings files.
+4. Physical Kaggle TPU hardware execution in data center environment.
+
+## 17.12 Commands / Tools Actually Used
+
+- `npm audit --omit=dev`
+- `python3 -c "import json; ..."` (package-lock.json and Cargo metadata analysis)
+- `cargo metadata --manifest-path src-tauri/Cargo.toml --locked --format-version 1`
+- `git fsck --full --no-reflogs --unreachable`
+- `git fsck --full --dangling`
+- `git count-objects -vH`
+- `git show-ref`
+- `git log --all --oneline`
+- `git log --all -S"..."`
+- `ss -taunp` (Build-time network socket tracking)
+- `python3 -m unittest discover -s tests -v`
+- `cargo test --manifest-path src-tauri/Cargo.toml`
+- `cargo check --manifest-path src-tauri/Cargo.toml --target x86_64-pc-windows-gnu`
+
+## 17.13 Final Secondary Verdict
+
+**Verdict:** `No malicious indicators, minor security concerns remain`
+
+**Explanation:**
+The secondary gap-driven audit verified the provenance, dependency graph, CI supply-chain, build network isolation, Git object integrity, and payload contents of `kaggle-tpu-lab`. No backdoors, malicious code, covert exfiltration, or supply-chain trojans were found. Minor informational recommendations regarding GitHub Actions SHA-pinning and explicit file permission flags were noted.
+
+---
+
+### Secondary Pass — Bottom Line
+
+1. **Highest-Risk Finding:** GitHub Actions workflow pins third-party actions by major tag (@v4/@v5) rather than immutable commit SHA.
+2. **Second-Highest-Risk Finding:** Subprocess execution relies on relative `PATH` resolution for `python` and `kaggle` executables.
+3. **Malware Indicators:** Zero malicious code, stealth persistence, or backdoors detected across all dependencies, scripts, and binaries.
+4. **Credential Theft:** Zero credential harvesting or unauthorized file/browser database access present.
+5. **Keylogging/Input Surveillance:** Zero keylogging, raw input hooks, or unauthorized background clipboard reading detected.
+6. **Supply Chain:** 100% of NPM and Cargo dependencies resolve from official registries (`registry.npmjs.org` and `crates.io`).
+7. **Installer Gap:** Native Windows NSIS installer execution remains untested due to Linux platform boundaries.
+8. **Secret Handling:** API keys remain strictly in Rust memory and local state files; masked in snapshots and redacted in logs.
+9. **Remaining Uncertainty:** Native Windows runtime behavior and live Kaggle TPU data center execution require native platforms.
+10. **Final Recommendation:** Safe to build and run; consider SHA-pinning CI actions for enhanced supply-chain hardening.
